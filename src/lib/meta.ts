@@ -14,7 +14,7 @@ export function startPixel() {
  const click=new URL(location.href).searchParams.get('fbclid');
  if(click&&/^[A-Za-z0-9_.-]{1,300}$/.test(click))document.cookie='_fbc=fb.1.'+Date.now()+'.'+click+'; Max-Age=7776000; Path=/; SameSite=Lax; Secure';
  const s=document.createElement('script'); s.async=true; s.src='https://connect.facebook.net/en_US/fbevents.js'; document.head.appendChild(s);
- q('track','PageView'); track('ViewContent',{content_ids:['kit-depilador'],content_type:'product',currency:'BRL',value:1.00});
+ q('track','PageView'); track('ViewContent',{content_ids:['kit-depilador'],content_type:'product',currency:'BRL',value:1.50});
 }
 export function track(name:string,data:Record<string,unknown>,id?:string) {
  if (!marketingAllowed() || !window.fbq) return;

@@ -84,12 +84,12 @@ export const OfferSection: React.FC<OfferSectionProps> = ({
                       Kit Depilador Elétrico 4 em 1
                     </p>
                     <p className="text-xs text-muted-foreground sm:text-sm">
-                      R$ 1,00 cada — leve quantas quiser
+                      R$ 1,50 cada — leve quantas quiser
                     </p>
                   </div>
                 </div>
                 <p className="shrink-0 whitespace-nowrap text-right font-display text-2xl font-extrabold text-primary">
-                  R$ 1,00
+                  R$ 1,50
                 </p>
               </div>
 

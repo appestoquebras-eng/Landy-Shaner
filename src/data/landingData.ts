@@ -96,6 +96,6 @@ export const FAQ_ITEMS: FaqItem[] = [
   }
 ];
 
-export const PRODUCT_BASE_PRICE = 1.00;
+export const PRODUCT_BASE_PRICE = 1.50;
 export const CREAM_UPSELL_PRICE = 15.00;
 export const CREAM_ORIGINAL_PRICE = 25.00;

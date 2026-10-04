@@ -46,12 +46,12 @@ export default function App() {
   }, []);
 
   const handleOpenUpsell = () => {
-    track('AddToCart',{content_ids:['kit-depilador'],content_type:'product',currency:'BRL',value:quantity*1.00});
+    track('AddToCart',{content_ids:['kit-depilador'],content_type:'product',currency:'BRL',value:quantity*1.50});
     setIsUpsellOpen(true);
   };
 
   const handleSelectUpsellOption = (withCream: boolean) => {
-    track('InitiateCheckout',{currency:'BRL',value:quantity*1.00+(withCream?15:0),num_items:quantity+(withCream?1:0)});
+    track('InitiateCheckout',{currency:'BRL',value:quantity*1.50+(withCream?15:0),num_items:quantity+(withCream?1:0)});
     setIncludeCream(withCream);
     setIsUpsellOpen(false);
     setCurrentPage('checkout');

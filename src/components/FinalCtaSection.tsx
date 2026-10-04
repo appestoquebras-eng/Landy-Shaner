@@ -37,7 +37,7 @@ export const FinalCtaSection: React.FC<FinalCtaSectionProps> = ({ onCtaClick }) 
           Pronta para se sentir ainda mais incrível?
         </h2>
         <p className="mt-3 text-base sm:text-lg text-primary-foreground/90">
-          Kit 4 em 1 por R$ 1,00 cada — leve quantas quiser. Frete grátis e garantia de 30 dias.
+          Kit 4 em 1 por R$ 1,50 cada — leve quantas quiser. Frete grátis e garantia de 30 dias.
         </p>
 
         <button

@@ -33,7 +33,7 @@ declare const process: any;
 export const CATALOG = {
   KIT_ID: 'kit-depilador-4em1',
   KIT_NAME: 'Kit Depilador 4 em 1 Landy Shaner',
-  KIT_PRICE_CENTS: 100, // R$ 1,00 — teste temporário
+  KIT_PRICE_CENTS: 150, // R$ 1,50 — teste temporário
   CREAM_ID: 'creme-clareador-clear-beauty',
   CREAM_NAME: 'Creme Clareador Íntimo e Corporal Clear Beauty',
   CREAM_PRICE_CENTS: 1500, // R$ 15,00
@@ -602,7 +602,7 @@ export function createCheckoutHandler(deps: CheckoutHandlerDeps = {}) {
             return new Response(
               JSON.stringify({
                 success: false,
-                error: { message: 'Não foi possível gerar a cobrança Pix no gateway.' },
+                error: { message: sigiloJson.errorCode==='GATEWAY_INVALID_ARGUMENT'&&/^Valor mínimo para transação é de R\$ \d{1,6},\d{2}$/.test(String(sigiloJson.message||'')) ? String(sigiloJson.message) : 'Não foi possível gerar a cobrança Pix no gateway.' },
               }),
               { status: 502, headers: corsHeaders }
             );
