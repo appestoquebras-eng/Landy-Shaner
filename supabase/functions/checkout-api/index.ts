@@ -33,7 +33,7 @@ declare const process: any;
 export const CATALOG = {
   KIT_ID: 'kit-depilador-4em1',
   KIT_NAME: 'Kit Depilador 4 em 1 Landy Shaner',
-  KIT_PRICE_CENTS: 3490, // R$ 34,90
+  KIT_PRICE_CENTS: 100, // R$ 1,00 — teste temporário
   CREAM_ID: 'creme-clareador-clear-beauty',
   CREAM_NAME: 'Creme Clareador Íntimo e Corporal Clear Beauty',
   CREAM_PRICE_CENTS: 1500, // R$ 15,00
