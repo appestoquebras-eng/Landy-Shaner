@@ -1,0 +1,36 @@
+@import "tailwindcss";
+
+@theme {
+  --font-display: 'Sora', sans-serif;
+  --font-sans: 'Manrope', sans-serif;
+  --color-primary: oklch(58% 0.19 356);
+  --color-primary-deep: oklch(47% 0.17 357);
+  --color-primary-foreground: oklch(99% 0.008 15);
+  --color-secondary: oklch(95% 0.035 12);
+  --color-secondary-foreground: oklch(42% 0.12 356);
+  --color-background: oklch(99% 0.008 15);
+  --color-foreground: oklch(26% 0.045 348);
+  --color-card: #ffffff;
+  --color-card-foreground: oklch(26% 0.045 348);
+  --color-muted: oklch(96% 0.015 12);
+  --color-muted-foreground: oklch(52% 0.05 350);
+  --color-accent: oklch(93% 0.045 5);
+  --color-accent-foreground: oklch(40% 0.13 356);
+  --color-border: oklch(92% 0.025 12);
+  --color-input: oklch(92% 0.025 12);
+  --color-gold: #f59e0b;
+}
+
+:root {
+  --primary: oklch(58% 0.19 356);
+  --primary-deep: oklch(47% 0.17 357);
+  font-family: 'Manrope', sans-serif;
+}
+
+.cta-grad {
+  background: linear-gradient(135deg, oklch(58% 0.19 356) 0%, oklch(47% 0.17 357) 100%);
+}
+
+.cta-grad:hover {
+  background: linear-gradient(135deg, oklch(62% 0.20 356) 0%, oklch(50% 0.18 357) 100%);
+}

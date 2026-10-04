@@ -1,0 +1,8 @@
+{
+  "name": "Kit Depilador Elétrico 4 em 1 — Landy Shaner",
+  "description": "Kit Depilador Elétrico 4 em 1 Multifuncional por R$ 34,90 com frete grátis. Prático para o corpo, rosto e sobrancelhas.",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
