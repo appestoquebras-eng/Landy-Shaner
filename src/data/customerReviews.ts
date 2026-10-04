@@ -19,5 +19,5 @@ export const CUSTOMER_REVIEWS = [
   ['Isabela O.', 'Entrega rápida e pedido certinho. Fiquei satisfeita e recomendo.'],
 ] as const;
 
-// Photos form an independent gallery; their owners have not been identified.
+// Store owner requested mixed photo placement; photo ownership is not mapped.
 export const CUSTOMER_PHOTOS = Array.from({length: 18}, (_, i) => `/images/reviews/photo-${String(i + 1).padStart(2, '0')}.${[2,3,5,6,7,8,9].includes(i + 1) ? 'webp' : i === 14 ? 'png' : 'jpg'}`);

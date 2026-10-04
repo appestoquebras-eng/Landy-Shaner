@@ -1,5 +1,5 @@
 import React, {useEffect, useRef, useState} from 'react';
-import {MessageCircle, Camera, X, ChevronLeft, ChevronRight, ZoomIn} from 'lucide-react';
+import {MessageCircle, X, ChevronLeft, ChevronRight, ZoomIn} from 'lucide-react';
 import {CUSTOMER_PHOTOS, CUSTOMER_REVIEWS} from '../data/customerReviews';
 
 export const TestimonialsSection: React.FC<{checkout?: boolean}> = ({checkout = false}) => {
@@ -21,19 +21,15 @@ export const TestimonialsSection: React.FC<{checkout?: boolean}> = ({checkout = 
           <p className="mt-3 text-sm text-muted-foreground">Comentários e fotos compartilhados pelas nossas clientes.</p>
         </div>
         <div className="mt-8 grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
-          {CUSTOMER_REVIEWS.slice(0, expanded ? undefined : 6).map(([name, text]) => (
-            <article key={name} className="rounded-2xl border border-border bg-card p-5 shadow-sm">
+          {CUSTOMER_REVIEWS.slice(0, expanded ? undefined : 6).map(([name, text], i) => (
+            <article key={name} className="flex flex-col rounded-2xl border border-border bg-card p-5 shadow-sm">
+              <button type="button" onClick={event => {opener.current = event.currentTarget; setPhoto(i);}} aria-label={`Ampliar foto ${i + 1} do kit recebido`} className="group relative mb-5 h-52 w-full overflow-hidden rounded-xl border border-border bg-background focus-visible:outline-2 focus-visible:outline-primary"><img src={CUSTOMER_PHOTOS[i]} alt={`Foto ${i + 1} do kit e embalagem`} loading="lazy" decoding="async" className="h-full w-full object-contain transition-transform group-hover:scale-105"/><span aria-hidden="true" className="absolute bottom-2 right-2 rounded-full bg-black/55 p-1.5 text-white"><ZoomIn size={16}/></span></button>
               <p className="text-sm leading-relaxed text-foreground/90">“{text}”</p>
               <div className="mt-5 flex items-center gap-3 border-t border-border/60 pt-4"><span aria-hidden="true" className="flex h-9 w-9 items-center justify-center rounded-full bg-secondary text-primary font-bold">{name[0]}</span><p className="text-sm font-bold">{name}</p></div>
             </article>
           ))}
         </div>
         <div className="mt-6 text-center"><button type="button" onClick={() => setExpanded(!expanded)} className="rounded-full border border-primary/25 bg-card px-6 py-3 text-sm font-bold text-primary hover:bg-secondary focus-visible:outline-2 focus-visible:outline-primary">{expanded ? 'Mostrar menos avaliações' : 'Ver todas as 18 avaliações'}</button></div>
-        <div className="mt-10 flex items-center gap-2"><Camera className="text-primary" size={20}/><h3 className="font-display font-bold text-lg">Fotos compartilhadas pelas clientes</h3></div>
-        <p className="mt-2 text-xs text-muted-foreground">Toque em uma foto para ampliar.</p>
-        <div className="mt-4 grid grid-cols-3 gap-2 sm:grid-cols-6 sm:gap-3">
-          {CUSTOMER_PHOTOS.map((src, i) => <button key={src} type="button" onClick={event => {opener.current = event.currentTarget; setPhoto(i);}} aria-label={`Ampliar foto ${i + 1} do kit recebido`} className="group relative aspect-square overflow-hidden rounded-xl border border-border bg-card focus-visible:outline-2 focus-visible:outline-primary"><img src={src} alt={`Foto ${i + 1} do kit e embalagem`} loading="lazy" decoding="async" className="h-full w-full object-contain transition-transform group-hover:scale-105"/><span aria-hidden="true" className="absolute bottom-2 right-2 rounded-full bg-black/55 p-1.5 text-white"><ZoomIn size={13}/></span></button>)}
-        </div>
         <dialog ref={dialog} aria-label="Foto ampliada do produto" onCancel={() => setPhoto(null)} onClose={() => setPhoto(null)} onClick={event => {if (event.target === event.currentTarget) setPhoto(null);}} onKeyDown={event => {if (event.key === 'ArrowRight') move(1); if (event.key === 'ArrowLeft') move(-1);}} className="m-auto max-h-[94dvh] w-[min(94vw,800px)] rounded-2xl bg-card p-3 text-foreground shadow-xl backdrop:bg-black/75">
           {photo !== null && <><div className="flex items-center justify-between pb-2"><p className="text-sm font-bold">Foto {photo + 1} de 18</p><button autoFocus type="button" aria-label="Fechar foto" onClick={() => setPhoto(null)} className="rounded-full p-2 hover:bg-secondary"><X size={22}/></button></div><img src={CUSTOMER_PHOTOS[photo]} alt={`Foto ${photo + 1} ampliada do kit e embalagem`} className="mx-auto max-h-[70dvh] max-w-full object-contain"/><div className="mt-3 flex justify-between"><button type="button" aria-label="Foto anterior" onClick={() => move(-1)} className="flex items-center gap-1 rounded-full bg-secondary px-4 py-2 text-sm font-bold"><ChevronLeft size={18}/>Anterior</button><button type="button" aria-label="Próxima foto" onClick={() => move(1)} className="flex items-center gap-1 rounded-full bg-secondary px-4 py-2 text-sm font-bold">Próxima<ChevronRight size={18}/></button></div></>}
         </dialog>
