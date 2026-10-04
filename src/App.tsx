@@ -1,4 +1,5 @@
 import {kitTotal} from './data/landingData';
+import {PurchaseNotifications} from './components/PurchaseNotifications';
 import {track} from './lib/meta';
 import {AdminPanel} from './components/AdminPanel';
 import {recordStoreEvent} from './lib/storeAnalytics';
@@ -92,6 +93,7 @@ export default function App() {
   return (
     <div className="min-h-screen bg-background text-foreground antialiased font-sans">
       <Navbar onBuyClick={scrollToOffer} />
+      <PurchaseNotifications />
       
       <main>
         <HeroSection onCtaClick={scrollToOffer} />

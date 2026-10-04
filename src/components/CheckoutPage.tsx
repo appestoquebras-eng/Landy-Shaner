@@ -1,4 +1,5 @@
 import {trackPurchase} from '../lib/meta';
+import {PurchaseNotifications} from './PurchaseNotifications';
 import {deliveryWindow} from '../lib/delivery';
 import {recordPixCopy} from '../lib/storeAnalytics';
 import React, { useState, useEffect, useRef } from 'react';
@@ -342,6 +343,7 @@ export const CheckoutPage: React.FC<CheckoutPageProps> = ({
 
   return (
     <div className="min-h-screen bg-background text-foreground pb-20">
+      {!isGenerated&&!isPaid&&<PurchaseNotifications />}
       {/* Top Header */}
       <header className="border-b border-border bg-card/90 backdrop-blur sticky top-0 z-30">
         <div className="mx-auto flex max-w-6xl items-center justify-between px-4 py-3">
