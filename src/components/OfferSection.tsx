@@ -1,6 +1,6 @@
 import React, { useState, useEffect } from 'react';
 import { Lock, Shield, Truck } from 'lucide-react';
-import { PRODUCT_BASE_PRICE } from '../data/landingData';
+import { kitTotal, kitDiscount, PRODUCT_BASE_PRICE } from '../data/landingData';
 
 interface OfferSectionProps {
   quantity: number;
@@ -43,7 +43,7 @@ export const OfferSection: React.FC<OfferSectionProps> = ({
     return `${mins.toString().padStart(2, '0')}:${secs.toString().padStart(2, '0')}`;
   };
 
-  const totalPrice = (quantity * PRODUCT_BASE_PRICE).toFixed(2).replace('.', ',');
+  const totalPrice = (kitTotal(quantity)).toFixed(2).replace('.', ',');
 
   return (
     <section id="oferta" className="scroll-mt-16 bg-background py-14 sm:py-20">
@@ -163,6 +163,7 @@ export const OfferSection: React.FC<OfferSectionProps> = ({
                 </span>
               </div>
               <p className="mt-1 text-right text-xs text-muted-foreground">à vista no Pix</p>
+              <p className="mt-3 rounded-xl bg-emerald-50 p-3 text-xs font-semibold text-emerald-800">{quantity>=2?`10% de desconto aplicado nas maquininhas. Você economiza R$ ${kitDiscount(quantity).toFixed(2).replace('.',',')}.`:'Leve 2 ou mais maquininhas e ganhe 10% de desconto nelas.'}</p>
 
               <button
                 onClick={onProceedToCheckout}
@@ -190,3 +191,4 @@ export const OfferSection: React.FC<OfferSectionProps> = ({
     </section>
   );
 };
+

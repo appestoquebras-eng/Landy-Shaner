@@ -84,7 +84,7 @@ export const FAQ_ITEMS: FaqItem[] = [
   },
   {
     q: 'Em quanto tempo eu recebo?',
-    a: 'Enviamos em até 24h após a confirmação. O prazo médio de entrega é de 5 a 12 dias úteis, dependendo da sua região.'
+    a: 'Enviamos no mesmo dia ou no próximo dia útil após a confirmação do pagamento. A estimativa de entrega é de 2 dias úteis após a postagem. Informe seu CEP no checkout para ver as datas previstas. O prazo pode variar conforme a região e a transportadora.'
   },
   {
     q: 'O aparelho é indolor mesmo?',
@@ -97,5 +97,7 @@ export const FAQ_ITEMS: FaqItem[] = [
 ];
 
 export const PRODUCT_BASE_PRICE = 34.90;
+export function kitTotal(quantity:number) {return quantity*(quantity>=2?3141:3490)/100;}
+export function kitDiscount(quantity:number) {return quantity>=2?quantity*349/100:0;}
 export const CREAM_UPSELL_PRICE = 15.00;
 export const CREAM_ORIGINAL_PRICE = 25.00;

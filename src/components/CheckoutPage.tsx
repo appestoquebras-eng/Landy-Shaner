@@ -20,7 +20,7 @@ import {
 } from 'lucide-react';
 import confetti from 'canvas-confetti';
 import QRCode from 'qrcode';
-import { PRODUCT_BASE_PRICE, CREAM_UPSELL_PRICE } from '../data/landingData';
+import { kitTotal, kitDiscount, PRODUCT_BASE_PRICE, CREAM_UPSELL_PRICE } from '../data/landingData';
 import { CheckoutFormData } from '../types';
 import { createCheckoutCharge, checkOrderStatus } from '../lib/api';
 
@@ -89,6 +89,7 @@ export const CheckoutPage: React.FC<CheckoutPageProps> = ({
 
   const [isGenerated, setIsGenerated] = useState<boolean>(false);
   const [isPaid, setIsPaid] = useState<boolean>(false);
+  const [chargedTotal,setChargedTotal]=useState<number|null>(null);
   const [copied, setCopied] = useState<boolean>(false);
   const [orderId, setOrderId] = useState<string>('');
   const [guestToken, setGuestToken] = useState<string>('');
@@ -99,8 +100,8 @@ export const CheckoutPage: React.FC<CheckoutPageProps> = ({
 
   const pollingRef = useRef<NodeJS.Timeout | null>(null);
 
-  const totalPrice = quantity * PRODUCT_BASE_PRICE + (cream ? CREAM_UPSELL_PRICE : 0);
-  const formattedTotal = totalPrice.toFixed(2).replace('.', ',');
+  const totalPrice = kitTotal(quantity) + (cream ? CREAM_UPSELL_PRICE : 0);
+  const formattedTotal = (chargedTotal??totalPrice).toFixed(2).replace('.', ',');
 
   // Formatting helpers
   const maskPhone = (val: string) => {
@@ -229,6 +230,7 @@ export const CheckoutPage: React.FC<CheckoutPageProps> = ({
       }
 
       if (response.status === 'paid') {
+        setChargedTotal(Number(response.totalPrice));
         setOrderId(response.orderId||'');
         trackPurchase(response.orderId||'',Number(response.totalPrice));
         setIsPaid(true);
@@ -247,6 +249,7 @@ export const CheckoutPage: React.FC<CheckoutPageProps> = ({
       }
 
       if (response.orderId && response.guestToken && response.pixCode) {
+        if(Number.isFinite(Number(response.totalPrice)))setChargedTotal(Number(response.totalPrice));
         setOrderId(response.orderId);
         setGuestToken(response.guestToken);
         setPixCode(response.pixCode);
@@ -304,6 +307,7 @@ export const CheckoutPage: React.FC<CheckoutPageProps> = ({
       try {
         const res = await checkOrderStatus(orderId, guestToken);
         if (res.success && res.status === 'paid') {
+          setChargedTotal(Number(res.totalPrice));
           trackPurchase(res.orderId||orderId,Number(res.totalPrice));
           setIsPaid(true);
           confetti({
@@ -802,29 +806,31 @@ export const CheckoutPage: React.FC<CheckoutPageProps> = ({
                     <img
                       src="/images/kit-card-machine-Db6Uq9A5.png"
                       alt="Aparelho"
-                      className="h-10 w-10 shrink-0 object-contain"
+                      className="h-20 w-20 rounded-xl border border-border bg-white p-2 shrink-0 object-contain"
                     />
                     <div className="min-w-0">
                       <p className="font-semibold text-foreground truncate">
                         {quantity}x Kit Depilador 4 em 1
                       </p>
                       <p className="text-[11px] text-muted-foreground">
-                        R$ 34,90 cada
+                        {quantity>=2?'R$ 31,41 cada · 10% de desconto':'R$ 34,90 cada'}
                       </p>
                     </div>
                   </div>
                   <span className="font-bold text-foreground whitespace-nowrap">
-                    R$ {(quantity * PRODUCT_BASE_PRICE).toFixed(2).replace('.', ',')}
+                    R$ {(kitTotal(quantity)).toFixed(2).replace('.', ',')}
                   </span>
                 </div>
 
                 {/* Clareador option */}
                 <div className="flex items-center justify-between gap-3 border-t border-border/60 pt-3">
                   <div className="flex items-center gap-2 min-w-0">
+                    <img src="/images/clareador-promo.jpg" alt="Clareador Clear Beauty" className="h-20 w-20 rounded-xl border border-border bg-white object-contain shrink-0"/>
                     <input
                       type="checkbox"
                       id="toggle-cream"
                       checked={cream}
+                      disabled={isGenerated||isPaid||isSubmitting}
                       onChange={(e) => setCream(e.target.checked)}
                       className="h-4 w-4 rounded accent-primary cursor-pointer"
                     />
@@ -841,6 +847,7 @@ export const CheckoutPage: React.FC<CheckoutPageProps> = ({
                     </span>
                   )}
                 </div>
+                {quantity>=2&&<div className="rounded-xl bg-emerald-50 p-3 text-emerald-800 text-xs flex justify-between gap-2"><span>10% de desconto nas {quantity} maquininhas</span><strong>− R$ {kitDiscount(quantity).toFixed(2).replace('.',',')}</strong></div>}
 
                 <div className="flex justify-between gap-3 border-t border-border/60 pt-3">
                   <span className="text-muted-foreground">Frete para todo o Brasil</span>
@@ -880,3 +887,4 @@ export const CheckoutPage: React.FC<CheckoutPageProps> = ({
     </div>
   );
 };
+

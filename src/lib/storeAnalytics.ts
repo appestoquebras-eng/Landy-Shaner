@@ -1,6 +1,6 @@
 const base = (import.meta.env.VITE_CHECKOUT_API_URL || '').replace(/\/$/, '');
 export function recordStoreEvent(event: 'visit' | 'checkout') {
-  if (!base || location.pathname === '/painel') return;
+  if (!base || location.pathname.replace(/\/$/,'') === '/painel') return;
   try {
     let visitor = localStorage.getItem('landy_visitor');
     if (!visitor) { visitor = crypto.randomUUID(); localStorage.setItem('landy_visitor', visitor); }

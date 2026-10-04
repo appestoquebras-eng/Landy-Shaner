@@ -1,2 +1,1 @@
-/painel /index.html 200
-/painel/ /index.html 200
+# Cloudflare Pages serves the React SPA fallback automatically.

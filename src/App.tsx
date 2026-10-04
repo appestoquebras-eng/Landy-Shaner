@@ -1,3 +1,4 @@
+import {kitTotal} from './data/landingData';
 import {track} from './lib/meta';
 import {AdminPanel} from './components/AdminPanel';
 import {recordStoreEvent} from './lib/storeAnalytics';
@@ -49,12 +50,12 @@ export default function App() {
   }, []);
 
   const handleOpenUpsell = () => {
-    track('AddToCart',{content_ids:['kit-depilador'],content_type:'product',currency:'BRL',value:quantity*34.90});
+    track('AddToCart',{content_ids:['kit-depilador'],content_type:'product',currency:'BRL',value:kitTotal(quantity)});
     setIsUpsellOpen(true);
   };
 
   const handleSelectUpsellOption = (withCream: boolean) => {
-    track('InitiateCheckout',{currency:'BRL',value:quantity*34.90+(withCream?15:0),num_items:quantity+(withCream?1:0)});
+    track('InitiateCheckout',{currency:'BRL',value:kitTotal(quantity)+(withCream?15:0),num_items:quantity+(withCream?1:0)});
     setIncludeCream(withCream);
     setIsUpsellOpen(false);
     setCurrentPage('checkout');
@@ -125,3 +126,4 @@ export default function App() {
     </div>
   );
 }
+

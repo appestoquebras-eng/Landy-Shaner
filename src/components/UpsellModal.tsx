@@ -1,6 +1,6 @@
 import React from 'react';
 import { X, Lock, Flame, Sparkles } from 'lucide-react';
-import { PRODUCT_BASE_PRICE } from '../data/landingData';
+import { kitTotal, kitDiscount, PRODUCT_BASE_PRICE } from '../data/landingData';
 
 interface UpsellModalProps {
   isOpen: boolean;
@@ -17,7 +17,7 @@ export const UpsellModal: React.FC<UpsellModalProps> = ({
 }) => {
   if (!isOpen) return null;
 
-  const orderTotalFormatted = (quantity * PRODUCT_BASE_PRICE).toFixed(2).replace('.', ',');
+  const orderTotalFormatted = (kitTotal(quantity)).toFixed(2).replace('.', ',');
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center p-3 sm:p-4 bg-black/70 backdrop-blur-sm animate-fadeIn">
@@ -126,3 +126,4 @@ export const UpsellModal: React.FC<UpsellModalProps> = ({
     </div>
   );
 };
+

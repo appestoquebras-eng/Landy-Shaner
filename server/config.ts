@@ -47,7 +47,8 @@ export function calculateOrderAmounts(quantity: number, includeCream: boolean): 
   items: Array<{ id: string; name: string; quantity: number; price: number; physical: boolean }>;
 } {
   const safeQty = Math.max(1, Math.floor(quantity || 1));
-  const kitTotalCents = safeQty * CONFIG.CATALOG.KIT_PRICE_CENTS;
+  const kitUnitCents = safeQty>=2?Math.round(CONFIG.CATALOG.KIT_PRICE_CENTS*0.9):CONFIG.CATALOG.KIT_PRICE_CENTS;
+  const kitTotalCents = safeQty * kitUnitCents;
   const creamTotalCents = includeCream ? CONFIG.CATALOG.CREAM_PRICE_CENTS : 0;
   const amountCents = kitTotalCents + creamTotalCents;
   const amountReais = Number((amountCents / 100).toFixed(2));
@@ -57,7 +58,7 @@ export function calculateOrderAmounts(quantity: number, includeCream: boolean): 
       id: CONFIG.CATALOG.KIT_ID,
       name: CONFIG.CATALOG.KIT_NAME,
       quantity: safeQty,
-      price: Number((CONFIG.CATALOG.KIT_PRICE_CENTS / 100).toFixed(2)),
+      price: Number((kitUnitCents / 100).toFixed(2)),
       physical: true,
     },
   ];
@@ -83,3 +84,4 @@ export function sanitizeDigits(str: string | undefined | null): string {
   if (!str) return '';
   return str.replace(/\D/g, '');
 }
+

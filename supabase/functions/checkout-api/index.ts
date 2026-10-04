@@ -107,7 +107,8 @@ export function timingSafeEqualStr(a: string, b: string): boolean {
 
 export function calculateOrderAmounts(quantity: number, includeCream: boolean) {
   const safeQty = Math.max(1, Math.min(10, Math.floor(quantity || 1)));
-  const kitTotalCents = safeQty * CATALOG.KIT_PRICE_CENTS;
+  const kitUnitCents = safeQty>=2?Math.round(CATALOG.KIT_PRICE_CENTS*0.9):CATALOG.KIT_PRICE_CENTS;
+  const kitTotalCents = safeQty * kitUnitCents;
   const creamTotalCents = includeCream ? CATALOG.CREAM_PRICE_CENTS : 0;
   const amountCents = kitTotalCents + creamTotalCents;
   const amountReais = Number((amountCents / 100).toFixed(2));
@@ -117,7 +118,7 @@ export function calculateOrderAmounts(quantity: number, includeCream: boolean) {
       id: CATALOG.KIT_ID,
       name: CATALOG.KIT_NAME,
       quantity: safeQty,
-      price: Number((CATALOG.KIT_PRICE_CENTS / 100).toFixed(2)),
+      price: Number((kitUnitCents / 100).toFixed(2)),
       physical: true,
     },
   ];

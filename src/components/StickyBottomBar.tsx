@@ -1,5 +1,5 @@
 import React from 'react';
-import { PRODUCT_BASE_PRICE } from '../data/landingData';
+import { kitTotal, kitDiscount, PRODUCT_BASE_PRICE } from '../data/landingData';
 
 interface StickyBottomBarProps {
   quantity: number;
@@ -7,7 +7,7 @@ interface StickyBottomBarProps {
 }
 
 export const StickyBottomBar: React.FC<StickyBottomBarProps> = ({ quantity, onBuyClick }) => {
-  const totalPrice = (quantity * PRODUCT_BASE_PRICE).toFixed(2).replace('.', ',');
+  const totalPrice = (kitTotal(quantity)).toFixed(2).replace('.', ',');
 
   return (
     <>
@@ -36,3 +36,4 @@ export const StickyBottomBar: React.FC<StickyBottomBarProps> = ({ quantity, onBu
     </>
   );
 };
+
