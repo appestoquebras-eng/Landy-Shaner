@@ -40,8 +40,10 @@ export function PurchaseNotifications(){
  const [name,city,quantity]=purchases[index];
  return <aside aria-label="Compra anterior de cliente" style={{animation:`purchase-notice ${duration}ms ease both`}} className="purchase-notice fixed top-20 left-3 right-3 sm:left-1/2 sm:right-auto sm:-translate-x-1/2 sm:w-96 z-40 rounded-2xl border border-primary/15 bg-white shadow-lg p-4 flex gap-3 text-foreground">
   <div className="h-11 w-11 shrink-0 rounded-xl bg-secondary flex items-center justify-center"><ShoppingBag size={23} className="text-primary"/></div>
-  <div className="min-w-0 pr-4"><p className="text-[10px] font-bold uppercase tracking-wider text-muted-foreground">Compra anterior · Clientes da loja</p><p className="text-sm font-bold mt-1">{name}</p><p className="text-xs text-muted-foreground mt-0.5">{city}</p><p className="text-xs mt-2">Comprou <strong>{quantity} {quantity===1?'unidade':'unidades'}</strong> do Kit 4 em 1</p></div>
+  <div className="min-w-0 pr-4"><p className="text-sm font-bold mt-1">{name}</p><p className="text-xs text-muted-foreground mt-0.5">{city}</p><p className="text-xs mt-2">Comprou <strong>{quantity} {quantity===1?'unidade':'unidades'}</strong> do Kit 4 em 1</p></div>
   <button type="button" onClick={close} aria-label="Fechar notificações de compras" className="absolute right-2 top-2 p-1 rounded-full text-muted-foreground hover:bg-muted"><X size={16}/></button>
  </aside>;
 }
+
+
 
