@@ -5,10 +5,10 @@ import { CONFIG, isSupabaseServiceConfigured } from './config';
 export interface OrderRecord {
   id?: string;
   order_id: string;
-  identifier?: string;
-  idempotency_key?: string;
+  identifier: string;
+  idempotency_key: string;
   customer_name: string;
-  customer_email?: string | null;
+  customer_email: string;
   customer_phone: string;
   customer_cpf: string;
   postal_code: string;
@@ -24,9 +24,10 @@ export interface OrderRecord {
   amount_cents: number;
   currency: string;
   payment_method: string;
-  status: 'creating' | 'pending' | 'uncertain' | 'paid' | 'canceled' | 'refunded';
+  status: 'creating' | 'pending' | 'uncertain' | 'paid' | 'canceled' | 'refunded' | 'charged_back';
   pix_code?: string;
   pix_image?: string | null;
+  expires_at?: string | null;
   transaction_id?: string;
   webhook_token?: string;
   guest_token_hash: string;
@@ -52,12 +53,11 @@ export function generateOrderAttemptIdentifier(orderId: string): string {
 }
 
 export function buildIdempotencyKey(cpf: string, phone: string, quantity: number, includeCream: boolean): string {
-  const timeWindow = Math.floor(Date.now() / 900000); // 15 minutos
-  return sha256Hex(`idem_${cpf}_${phone}_${quantity}_${includeCream}_${timeWindow}`);
+  return sha256Hex(`idem_${cpf}_${phone}_${quantity}_${includeCream}`);
 }
 
-// In-memory store para dev local e testes
 const memoryOrders = new Map<string, OrderRecord>();
+const memoryAttemptsByCpf = new Map<string, number[]>();
 
 let supabaseAdmin: SupabaseClient | null = null;
 if (isSupabaseServiceConfigured()) {
@@ -72,8 +72,9 @@ if (isSupabaseServiceConfigured()) {
 export async function createOrGetPendingOrder(params: {
   idempotencyKey: string;
   orderId: string;
+  identifier: string;
   customerName: string;
-  customerEmail?: string | null;
+  customerEmail: string;
   customerPhone: string;
   customerCpf: string;
   postalCode: string;
@@ -88,15 +89,16 @@ export async function createOrGetPendingOrder(params: {
   totalPrice: number;
   amountCents: number;
   guestTokenHash: string;
-}): Promise<{ existing: boolean; order: OrderRecord }> {
+}): Promise<{ existing: boolean; order: OrderRecord; isAbusive?: boolean; tokenMismatch?: boolean }> {
   // 1. Tenta RPC do Supabase se configurado
   if (supabaseAdmin) {
     try {
       const { data, error } = await supabaseAdmin.rpc('rpc_create_or_get_pending_order', {
         p_idempotency_key: params.idempotencyKey,
         p_order_id: params.orderId,
+        p_identifier: params.identifier,
         p_customer_name: params.customerName,
-        p_customer_email: params.customerEmail || null,
+        p_customer_email: params.customerEmail,
         p_customer_phone: params.customerPhone,
         p_customer_cpf: params.customerCpf,
         p_postal_code: params.postalCode,
@@ -115,6 +117,9 @@ export async function createOrGetPendingOrder(params: {
 
       if (!error && data) {
         const row = Array.isArray(data) ? data[0] : data;
+        if (row.is_abusive) return { existing: false, order: {} as any, isAbusive: true };
+        if (row.token_mismatch) return { existing: true, order: {} as any, tokenMismatch: true };
+
         const existing = Boolean(row.existing);
         const actualOrderId = row.order_id || params.orderId;
         const fetched = await getOrderByOrderId(actualOrderId);
@@ -127,21 +132,31 @@ export async function createOrGetPendingOrder(params: {
     }
   }
 
-  // 2. Fallback de desduplicação em memória
+  // 2. Proteção contra abuso em memória (15 tentativas na última hora)
+  const now = Date.now();
+  const recent = (memoryAttemptsByCpf.get(params.customerCpf) || []).filter((t) => now - t < 3600000);
+  if (recent.length >= 15) {
+    return { existing: false, order: {} as any, isAbusive: true };
+  }
+  recent.push(now);
+  memoryAttemptsByCpf.set(params.customerCpf, recent);
+
+  // 3. Fallback de desduplicação em memória
   for (const ord of memoryOrders.values()) {
-    if (
-      ord.idempotency_key === params.idempotencyKey &&
-      ['pending', 'creating', 'paid'].includes(ord.status)
-    ) {
+    if (ord.idempotency_key === params.idempotencyKey) {
+      if (ord.guest_token_hash !== params.guestTokenHash) {
+        return { existing: true, order: ord, tokenMismatch: true };
+      }
       return { existing: true, order: ord };
     }
   }
 
   const record: OrderRecord = {
     order_id: params.orderId,
+    identifier: params.identifier,
     idempotency_key: params.idempotencyKey,
     customer_name: params.customerName,
-    customer_email: params.customerEmail || null,
+    customer_email: params.customerEmail,
     customer_phone: params.customerPhone,
     customer_cpf: params.customerCpf,
     postal_code: params.postalCode,
@@ -164,6 +179,7 @@ export async function createOrGetPendingOrder(params: {
   };
 
   memoryOrders.set(record.order_id, record);
+  memoryOrders.set(record.identifier, record);
   return { existing: false, order: record };
 }
 
@@ -178,22 +194,25 @@ export async function attachSigilopayCharge(
     webhookToken?: string;
     pixCode?: string;
     pixImage?: string | null;
+    expiresAt?: string | null;
     gatewayStatus?: string;
     status: 'pending' | 'uncertain';
   }
 ): Promise<OrderRecord | null> {
   if (supabaseAdmin) {
     try {
-      await supabaseAdmin.rpc('rpc_attach_sigilopay_charge', {
+      const { data, error } = await supabaseAdmin.rpc('rpc_attach_sigilopay_charge', {
         p_order_id: orderId,
         p_identifier: charge.identifier,
         p_transaction_id: charge.transactionId || null,
         p_webhook_token: charge.webhookToken || null,
         p_pix_code: charge.pixCode || null,
         p_pix_image: charge.pixImage || null,
+        p_expires_at: charge.expiresAt ? new Date(charge.expiresAt).toISOString() : null,
         p_gateway_status: charge.gatewayStatus || null,
         p_status: charge.status,
       });
+      if (error || !data) return null;
     } catch (err) {
       console.warn('Erro ao anexar cobrança no Supabase:', err);
     }
@@ -209,6 +228,7 @@ export async function attachSigilopayCharge(
     webhook_token: charge.webhookToken || existing.webhook_token,
     pix_code: charge.pixCode || existing.pix_code,
     pix_image: charge.pixImage || existing.pix_image,
+    expires_at: charge.expiresAt || existing.expires_at,
     gateway_status: charge.gatewayStatus || existing.gateway_status,
     status: charge.status,
     updated_at: new Date().toISOString(),
@@ -221,9 +241,6 @@ export async function attachSigilopayCharge(
   return updated;
 }
 
-/**
- * Busca por orderId
- */
 export async function getOrderByOrderId(orderId: string): Promise<OrderRecord | null> {
   if (memoryOrders.has(orderId)) return memoryOrders.get(orderId)!;
 
@@ -238,9 +255,6 @@ export async function getOrderByOrderId(orderId: string): Promise<OrderRecord | 
   return null;
 }
 
-/**
- * Busca por transactionId
- */
 export async function getOrderByTransactionId(transactionId: string): Promise<OrderRecord | null> {
   if (memoryOrders.has(transactionId)) return memoryOrders.get(transactionId)!;
 
@@ -259,9 +273,6 @@ export async function getOrderByTransactionId(transactionId: string): Promise<Or
   return null;
 }
 
-/**
- * Confirma pagamento de forma atômica e idempotente.
- */
 export async function confirmSigilopayPayment(
   transactionId: string,
   identifier: string,
@@ -285,9 +296,12 @@ export async function confirmSigilopayPayment(
     }
   }
 
-  // Fallback em memória
-  const order = (await getOrderByTransactionId(transactionId)) || (await getOrderByOrderId(identifier));
-  if (!order) return { success: false, action: 'ORDER_NOT_FOUND' };
+  const order = await getOrderByTransactionId(transactionId);
+  if (!order || order.identifier !== identifier) return { success: false, action: 'ORDER_NOT_FOUND' };
+
+  if (['refunded', 'charged_back'].includes(order.status)) {
+    return { success: false, action: 'TERMINAL_STATE_CANNOT_REVERT', orderId: order.order_id };
+  }
 
   if (order.status === 'paid') {
     return { success: true, action: 'ALREADY_PAID', orderId: order.order_id };
@@ -299,38 +313,35 @@ export async function confirmSigilopayPayment(
   order.updated_at = new Date().toISOString();
 
   memoryOrders.set(order.order_id, order);
-  if (order.transaction_id) memoryOrders.set(order.transaction_id, order);
-
   return { success: true, action: 'PAYMENT_CONFIRMED', orderId: order.order_id };
 }
 
-/**
- * Cancelamento / Estorno
- */
 export async function cancelOrRefundOrder(
   transactionId: string,
   identifier: string,
-  newStatus: 'canceled' | 'refunded'
+  newStatus: 'canceled' | 'refunded' | 'charged_back'
 ): Promise<boolean> {
   if (supabaseAdmin) {
     try {
-      await supabaseAdmin.rpc('rpc_update_order_cancellation', {
+      const { data, error } = await supabaseAdmin.rpc('rpc_update_order_cancellation', {
         p_transaction_id: transactionId,
         p_identifier: identifier,
         p_new_status: newStatus,
         p_gateway_status: newStatus.toUpperCase(),
       });
-      return true;
+      if (error || !data) return false;
+      const row = Array.isArray(data) ? data[0] : data;
+      return Boolean(row.success);
     } catch (err) {
       console.warn('Erro no RPC update_order_cancellation:', err);
     }
   }
 
-  const order = (await getOrderByTransactionId(transactionId)) || (await getOrderByOrderId(identifier));
-  if (!order) return false;
+  const order = await getOrderByTransactionId(transactionId);
+  if (!order || order.identifier !== identifier) return false;
 
   if (order.status === 'paid' && newStatus === 'canceled') {
-    return true; // Não cancela pedido pago
+    return false; // Não cancela pedido pago
   }
 
   order.status = newStatus;

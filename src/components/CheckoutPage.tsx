@@ -27,6 +27,32 @@ interface CheckoutPageProps {
   onBack: () => void;
 }
 
+const EMAIL_REGEX = /^[a-zA-Z0-9.!#$%&'*+/=?^_`{|}~-]+@[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?(?:\.[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)+$/;
+
+function isValidCPF(cpf: string): boolean {
+  const clean = cpf.replace(/\D/g, '');
+  if (clean.length !== 11) return false;
+  if (/^(\d)\1{10}$/.test(clean)) return false;
+
+  let sum = 0;
+  for (let i = 0; i < 9; i++) {
+    sum += parseInt(clean.charAt(i), 10) * (10 - i);
+  }
+  let rev = 11 - (sum % 11);
+  if (rev === 10 || rev === 11) rev = 0;
+  if (rev !== parseInt(clean.charAt(9), 10)) return false;
+
+  sum = 0;
+  for (let i = 0; i < 10; i++) {
+    sum += parseInt(clean.charAt(i), 10) * (11 - i);
+  }
+  rev = 11 - (sum % 11);
+  if (rev === 10 || rev === 11) rev = 0;
+  if (rev !== parseInt(clean.charAt(10), 10)) return false;
+
+  return true;
+}
+
 export const CheckoutPage: React.FC<CheckoutPageProps> = ({
   quantity,
   includeCream: initialIncludeCream,
@@ -140,13 +166,15 @@ export const CheckoutPage: React.FC<CheckoutPageProps> = ({
     if (!formData.name.trim() || formData.name.trim().split(' ').length < 2) {
       newErrors.name = 'Informe seu nome e sobrenome completo';
     }
-    const cleanPhone = formData.phone.replace(/\D/g, '');
-    if (cleanPhone.length < 10) {
-      newErrors.phone = 'Informe um WhatsApp com DDD válido';
+    if (!formData.email.trim() || !EMAIL_REGEX.test(formData.email.trim())) {
+      newErrors.email = 'Informe um e-mail válido obrigatório';
     }
-    const cleanCpf = formData.document.replace(/\D/g, '');
-    if (cleanCpf.length !== 11) {
-      newErrors.document = 'CPF inválido (11 dígitos)';
+    const cleanPhone = formData.phone.replace(/\D/g, '');
+    if (cleanPhone.length < 10 || cleanPhone.length > 11) {
+      newErrors.phone = 'Informe um WhatsApp com DDD válido (10 ou 11 dígitos)';
+    }
+    if (!isValidCPF(formData.document)) {
+      newErrors.document = 'CPF inválido (dígitos verificadores incorretos)';
     }
     const cleanCep = formData.postalCode.replace(/\D/g, '');
     if (cleanCep.length !== 8) {
@@ -191,12 +219,36 @@ export const CheckoutPage: React.FC<CheckoutPageProps> = ({
         return;
       }
 
+      if (response.status === 'paid') {
+        setIsPaid(true);
+        confetti({
+          particleCount: 120,
+          spread: 80,
+          origin: { y: 0.6 },
+        });
+        return;
+      }
+
+      if (response.status === 'uncertain') {
+        setErrorMessage('Sua cobrança está sendo confirmada com o gateway. Aguarde alguns instantes sem recriar o pedido.');
+        setIsSubmitting(false);
+        return;
+      }
+
       if (response.orderId && response.guestToken && response.pixCode) {
         setOrderId(response.orderId);
         setGuestToken(response.guestToken);
         setPixCode(response.pixCode);
         if (response.pixImage) {
           setPixImage(response.pixImage);
+        }
+
+        if (response.expiresAt) {
+          const expMs = new Date(response.expiresAt).getTime();
+          const diffSec = Math.max(0, Math.floor((expMs - Date.now()) / 1000));
+          if (diffSec > 0) {
+            setPixTimeLeft(diffSec);
+          }
         }
 
         // Gerar QR code local em alta definição a partir do código Pix real
@@ -546,15 +598,20 @@ export const CheckoutPage: React.FC<CheckoutPageProps> = ({
 
                     <div className="sm:col-span-2">
                       <label className="text-xs font-bold text-foreground">
-                        E-mail (opcional)
+                        E-mail *
                       </label>
                       <input
                         type="email"
                         placeholder="seuemail@exemplo.com"
                         value={formData.email}
                         onChange={(e) => handleInputChange('email', e.target.value)}
-                        className="mt-1 w-full rounded-xl border border-input bg-background px-4 py-2.5 text-sm text-foreground focus:outline-none focus:ring-2 focus:ring-primary"
+                        className={`mt-1 w-full rounded-xl border bg-background px-4 py-2.5 text-sm text-foreground focus:outline-none focus:ring-2 focus:ring-primary ${
+                          errors.email ? 'border-destructive ring-1 ring-destructive' : 'border-input'
+                        }`}
                       />
+                      {errors.email && (
+                        <p className="mt-1 text-xs text-destructive">{errors.email}</p>
+                      )}
                     </div>
                   </div>
                 </div>

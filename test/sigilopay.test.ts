@@ -1,31 +1,18 @@
 import assert from 'assert';
 import {
+  createCheckoutHandler,
+  isValidCPF,
+  isValidPhone,
   calculateOrderAmounts,
-  CONFIG,
-  isSigiloPayConfigured,
-  sanitizeDigits,
-} from '../server/config';
-import {
-  attachSigilopayCharge,
-  buildIdempotencyKey,
-  cancelOrRefundOrder,
-  confirmSigilopayPayment,
-  createOrGetPendingOrder,
-  generateGuestToken,
-  generateOrderAttemptIdentifier,
-  getOrderByOrderId,
-  getOrderByTransactionId,
-  OrderRecord,
   sha256Hex,
-} from '../server/db';
-import { secureCompareTokens } from '../server/sigilopay';
+} from '../supabase/functions/checkout-api/index';
 
-async function runTests() {
-  console.log('🧪 Iniciando Bateria Completa de Testes: Sigilo Pay & Edge Functions Free\n');
+async function runEdgeFunctionTests() {
+  console.log('🧪 Iniciando Bateria de Testes do Handler Oficial da Edge Function (checkout-api)\n');
   let passed = 0;
   let failed = 0;
 
-  async function test(name: string, fn: () => void | Promise<void>) {
+  async function test(name: string, fn: () => Promise<void> | void) {
     try {
       await fn();
       console.log(`  ✓ ${name}`);
@@ -36,371 +23,501 @@ async function runTests() {
     }
   }
 
-  // ------------------------------------------------------------------------
-  // 1. CÁLCULO SEGURO DE CATÁLOGO EM CENTAVOS
-  // ------------------------------------------------------------------------
-  console.log('📦 1. Catálogo e Preços em Centavos');
+  // Database Mock Adapter que simula exatamente o comportamento dos RPCs SQL do Supabase
+  const dbOrders = new Map<string, any>();
+  const dbCpfAttempts = new Map<string, number[]>();
 
-  await test('1x Kit Depilador: R$ 34,90 (3490 centavos)', () => {
-    const res = calculateOrderAmounts(1, false);
-    assert.strictEqual(res.amountCents, 3490);
-    assert.strictEqual(res.amountReais, 34.9);
-    assert.strictEqual(res.items.length, 1);
-  });
+  const mockSupabase = {
+    rpc: async (fnName: string, args: any) => {
+      if (fnName === 'rpc_create_or_get_pending_order') {
+        const cpf = args.p_customer_cpf;
+        const now = Date.now();
+        const attempts = (dbCpfAttempts.get(cpf) || []).filter((t) => now - t < 3600000);
+        if (attempts.length >= 15) {
+          return { data: [{ is_abusive: true }], error: null };
+        }
+        attempts.push(now);
+        dbCpfAttempts.set(cpf, attempts);
 
-  await test('1x Kit + Upsell Clareador: R$ 49,90 (4990 centavos)', () => {
-    const res = calculateOrderAmounts(1, true);
-    assert.strictEqual(res.amountCents, 4990);
-    assert.strictEqual(res.amountReais, 49.9);
-    assert.strictEqual(res.items.length, 2);
-  });
+        for (const ord of dbOrders.values()) {
+          if (ord.idempotency_key === args.p_idempotency_key) {
+            if (ord.guest_token_hash !== args.p_guest_token_hash) {
+              return { data: [{ token_mismatch: true }], error: null };
+            }
+            return {
+              data: [
+                {
+                  existing: true,
+                  order_id: ord.order_id,
+                  identifier: ord.identifier,
+                  status: ord.status,
+                  pix_code: ord.pix_code,
+                  pix_image: ord.pix_image,
+                  expires_at: ord.expires_at,
+                  total_price: ord.total_price,
+                },
+              ],
+              error: null,
+            };
+          }
+        }
 
-  await test('2x Kit + Upsell Clareador: R$ 84,80 (8480 centavos)', () => {
-    const res = calculateOrderAmounts(2, true);
-    assert.strictEqual(res.amountCents, 8480);
-    assert.strictEqual(res.amountReais, 84.8);
-  });
-
-  await test('Soma de preços unitários * quantidade deve ser exatamente idêntica ao amount total', () => {
-    for (let qty = 1; qty <= 6; qty++) {
-      for (const cream of [false, true]) {
-        const res = calculateOrderAmounts(qty, cream);
-        const sum = res.items.reduce((acc, it) => acc + Math.round(it.price * 100) * it.quantity, 0);
-        assert.strictEqual(sum, res.amountCents);
+        const newOrd = {
+          order_id: args.p_order_id,
+          identifier: args.p_identifier,
+          idempotency_key: args.p_idempotency_key,
+          customer_name: args.p_customer_name,
+          customer_email: args.p_customer_email,
+          customer_phone: args.p_customer_phone,
+          customer_cpf: args.p_customer_cpf,
+          quantity: args.p_quantity,
+          include_cream: args.p_include_cream,
+          total_price: args.p_total_price,
+          amount_cents: args.p_amount_cents,
+          status: 'creating',
+          guest_token_hash: args.p_guest_token_hash,
+          created_at: new Date().toISOString(),
+        };
+        dbOrders.set(newOrd.order_id, newOrd);
+        return { data: [{ existing: false, order_id: newOrd.order_id, identifier: newOrd.identifier }], error: null };
       }
+
+      if (fnName === 'rpc_attach_sigilopay_charge') {
+        const ord = dbOrders.get(args.p_order_id);
+        if (!ord) return { data: false, error: null };
+        ord.identifier = args.p_identifier;
+        ord.transaction_id = args.p_transaction_id;
+        ord.webhook_token = args.p_webhook_token;
+        ord.pix_code = args.p_pix_code;
+        ord.pix_image = args.p_pix_image;
+        ord.expires_at = args.p_expires_at;
+        ord.gateway_status = args.p_gateway_status;
+        ord.status = args.p_status;
+        return { data: true, error: null };
+      }
+
+      if (fnName === 'rpc_confirm_sigilopay_payment') {
+        let ord: any = null;
+        for (const o of dbOrders.values()) {
+          if (o.transaction_id === args.p_transaction_id && o.identifier === args.p_identifier) {
+            ord = o;
+            break;
+          }
+        }
+        if (!ord) return { data: [{ success: false, action: 'ORDER_NOT_FOUND' }], error: null };
+        if (['refunded', 'charged_back'].includes(ord.status)) {
+          return { data: [{ success: false, action: 'TERMINAL_STATE_CANNOT_REVERT' }], error: null };
+        }
+        if (ord.status === 'paid') {
+          return { data: [{ success: true, action: 'ALREADY_PAID', order_id: ord.order_id }], error: null };
+        }
+        ord.status = 'paid';
+        ord.paid_at = args.p_payed_at;
+        ord.gateway_status = 'COMPLETED';
+        return { data: [{ success: true, action: 'PAYMENT_CONFIRMED', order_id: ord.order_id }], error: null };
+      }
+
+      if (fnName === 'rpc_update_order_cancellation') {
+        let ord: any = null;
+        for (const o of dbOrders.values()) {
+          if (o.transaction_id === args.p_transaction_id && o.identifier === args.p_identifier) {
+            ord = o;
+            break;
+          }
+        }
+        if (!ord) return { data: [{ success: false, action: 'ORDER_NOT_FOUND' }], error: null };
+        if (ord.status === 'paid' && args.p_new_status === 'canceled') {
+          return { data: [{ success: false, action: 'PAID_CANNOT_BE_CANCELED' }], error: null };
+        }
+        ord.status = args.p_new_status;
+        ord.gateway_status = args.p_gateway_status;
+        return { data: [{ success: true, action: 'STATUS_UPDATED', order_id: ord.order_id }], error: null };
+      }
+
+      return { data: null, error: new Error('RPC não implementada no mock') };
+    },
+    from: (table: string) => ({
+      select: () => ({
+        eq: (col: string, val: string) => ({
+          maybeSingle: async () => {
+            if (table === 'orders') {
+              for (const ord of dbOrders.values()) {
+                if (ord[col] === val) return { data: ord, error: null };
+              }
+            }
+            return { data: null, error: null };
+          },
+        }),
+      }),
+    }),
+  };
+
+  const mockGatewayFetch: typeof fetch = async (input: RequestInfo | URL, init?: RequestInit) => {
+    const urlStr = String(input);
+    if (urlStr.includes('/gateway/pix/receive')) {
+      const body = JSON.parse(String(init?.body || '{}'));
+      if (body.client?.name === 'Force Timeout') {
+        throw new Error('AbortError: Gateway timeout');
+      }
+      return new Response(
+        JSON.stringify({
+          transactionId: `tx_${Date.now()}`,
+          status: 'OK',
+          transactionStatus: 'WAITING_PAYMENT',
+          webhookToken: `wh_tok_${Date.now()}`,
+          pix: {
+            code: '00020126...code_pix_oficial...',
+            image: 'https://app.sigilopay.com.br/qr.png',
+            expiresAt: new Date(Date.now() + 1800000).toISOString(),
+          },
+        }),
+        { status: 200, headers: { 'Content-Type': 'application/json' } }
+      );
     }
+    return new Response('Not Found', { status: 404 });
+  };
+
+  const handler = createCheckoutHandler({
+    supabaseClient: mockSupabase,
+    sigilopayPublicKey: 'pk_test_sigilopay',
+    sigilopaySecretKey: 'sk_test_sigilopay',
+    sigilopayCallbackUrl: 'https://ojvznzupiojimykqryhw.supabase.co/functions/v1/checkout-api/webhook',
+    fetchFn: mockGatewayFetch,
   });
 
   // ------------------------------------------------------------------------
-  // 2. SANITIZAÇÃO CORRETA: NOME E EMAIL PRESERVADOS
+  // 1. NORMALIZAÇÃO DE PATHS E HEALTH CHECK
   // ------------------------------------------------------------------------
-  console.log('\n📝 2. Sanitização de Entrada (Nome e E-mail preservados sem perda de dígitos)');
+  console.log('🌐 1. Normalização de Paths e Health Check');
 
-  await test('Nome e E-mail não devem ter dígitos removidos (apenas trim/clean)', () => {
-    const rawName = '  Maria da Silva 2ª Via  ';
-    const rawEmail = '  maria.silva123@exemplo.com  ';
+  await test('GET /functions/v1/checkout-api/health deve responder 200 OK', async () => {
+    const req = new Request('https://ojvznzupiojimykqryhw.supabase.co/functions/v1/checkout-api/health', { method: 'GET' });
+    const res = await handler(req);
+    assert.strictEqual(res.status, 200);
+    const data = await res.json();
+    assert.strictEqual(data.status, 'ok');
+  });
 
-    // A sanitização de dígitos deve ser aplicada SOMENTE ao CPF, CEP e Telefone
-    assert.strictEqual(sanitizeDigits('123.456.789-00'), '12345678900');
-    assert.strictEqual(sanitizeDigits('(11) 98765-4321'), '11987654321');
-    assert.strictEqual(sanitizeDigits('01310-100'), '01310100');
+  await test('GET /checkout-api/health deve responder 200 OK', async () => {
+    const req = new Request('https://ojvznzupiojimykqryhw.supabase.co/checkout-api/health', { method: 'GET' });
+    const res = await handler(req);
+    assert.strictEqual(res.status, 200);
+  });
 
-    // Valida que o processador preserva letras e números em emails e nomes
-    const processedName = rawName.trim();
-    const processedEmail = rawEmail.trim().toLowerCase();
-    assert.strictEqual(processedName, 'Maria da Silva 2ª Via');
-    assert.strictEqual(processedEmail, 'maria.silva123@exemplo.com');
+  await test('GET /health deve responder 200 OK', async () => {
+    const req = new Request('https://ojvznzupiojimykqryhw.supabase.co/health', { method: 'GET' });
+    const res = await handler(req);
+    assert.strictEqual(res.status, 200);
   });
 
   // ------------------------------------------------------------------------
-  // 3. DESDUPLICAÇÃO DURÁVEL E HASH DO GUEST TOKEN
+  // 2. VALIDAÇÃO DE ENTRADA E CHECKSUM CPF
   // ------------------------------------------------------------------------
-  console.log('\n🛡️ 3. Desduplicação Durável e Proteção de Token com Hash SHA-256');
+  console.log('\n🔍 2. Validação Estrita de Dados (Email, CPF, Quantidade, UF)');
 
-  await test('buildIdempotencyKey gera a mesma chave dentro da janela de tempo para mesma compra', () => {
-    const k1 = buildIdempotencyKey('12345678901', '11999998888', 1, true);
-    const k2 = buildIdempotencyKey('12345678901', '11999998888', 1, true);
-    assert.strictEqual(k1, k2);
-  });
-
-  await test('Guest token é gerado com token público e hash SHA-256 para persistência', () => {
-    const { rawToken, hash } = generateGuestToken();
-    assert.strictEqual(rawToken.length, 48);
-    assert.strictEqual(hash.length, 64);
-    assert.strictEqual(sha256Hex(rawToken), hash);
-  });
-
-  await test('createOrGetPendingOrder previne cobrança duplicada durável retornando existente', async () => {
-    const idemKey = `idem_test_${Date.now()}`;
-    const { rawToken, hash } = generateGuestToken();
-
-    const first = await createOrGetPendingOrder({
-      idempotencyKey: idemKey,
-      orderId: `LS-IDEM-1`,
-      customerName: 'Cliente Teste Idem',
-      customerPhone: '11999998888',
-      customerCpf: '12345678901',
-      postalCode: '01310100',
-      street: 'Rua A',
-      houseNumber: '10',
-      district: 'Bairro',
-      city: 'SP',
-      state: 'SP',
-      quantity: 1,
-      includeCream: false,
-      totalPrice: 34.9,
-      amountCents: 3490,
-      guestTokenHash: hash,
-    });
-    assert.strictEqual(first.existing, false);
-
-    // Segunda chamada idêntica na mesma janela
-    const second = await createOrGetPendingOrder({
-      idempotencyKey: idemKey,
-      orderId: `LS-IDEM-2`,
-      customerName: 'Cliente Teste Idem',
-      customerPhone: '11999998888',
-      customerCpf: '12345678901',
-      postalCode: '01310100',
-      street: 'Rua A',
-      houseNumber: '10',
-      district: 'Bairro',
-      city: 'SP',
-      state: 'SP',
-      quantity: 1,
-      includeCream: false,
-      totalPrice: 34.9,
-      amountCents: 3490,
-      guestTokenHash: hash,
-    });
-    assert.strictEqual(second.existing, true);
-    assert.strictEqual(second.order.order_id, 'LS-IDEM-1');
-  });
-
-  // ------------------------------------------------------------------------
-  // 4. TESTES NEGATIVOS ESTRITOS DE WEBHOOK (CADA CAMPO INDIVIDUALMENTE)
-  // ------------------------------------------------------------------------
-  console.log('\n⚡ 4. Testes Negativos de Validação de Webhook (Strict &&)');
-
-  const orderId = `LS-WEBHOOK-TEST-${Date.now()}`;
-  const txId = `tx_sigilo_${Date.now()}`;
-  const identifier = generateOrderAttemptIdentifier(orderId);
-  const webhookToken = `wh_token_${Date.now()}`;
-  const { hash: guestHash } = generateGuestToken();
-
-  const { order: baseOrder } = await createOrGetPendingOrder({
-    idempotencyKey: `idem_wh_${Date.now()}`,
-    orderId,
-    customerName: 'Comprador Teste',
-    customerPhone: '11999997777',
-    customerCpf: '11122233344',
+  const validPayload = {
+    idempotencyKey: 'intent_1234567890123456',
+    clientGuestToken: 'client_guest_token_123456789012345678901234',
+    name: 'Ana Maria Silva',
+    email: 'ana.maria@exemplo.com',
+    phone: '11987654321',
+    document: '11144477735', // CPF válido real
     postalCode: '01310100',
-    street: 'Av Paulista',
-    houseNumber: '500',
+    street: 'Avenida Paulista',
+    houseNumber: '1000',
     district: 'Bela Vista',
     city: 'São Paulo',
     state: 'SP',
     quantity: 1,
     includeCream: true,
-    totalPrice: 49.9,
-    amountCents: 4990,
-    guestTokenHash: guestHash,
+  };
+
+  await test('Requisição sem e-mail deve ser recusada com 400', async () => {
+    const req = new Request('https://ojvznzupiojimykqryhw.supabase.co/create', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ...validPayload, email: '' }),
+    });
+    const res = await handler(req);
+    assert.strictEqual(res.status, 400);
   });
 
-  await attachSigilopayCharge(orderId, {
-    identifier,
-    transactionId: txId,
-    webhookToken,
-    pixCode: '00020126...pix_code_real...',
-    pixImage: 'https://sigilopay.com.br/qr.png',
-    gatewayStatus: 'WAITING_PAYMENT',
-    status: 'pending',
+  await test('Requisição com CPF com checksum inválido deve ser recusada com 400', async () => {
+    const req = new Request('https://ojvznzupiojimykqryhw.supabase.co/create', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ...validPayload, document: '12345678900' }), // CPF inválido
+    });
+    const res = await handler(req);
+    assert.strictEqual(res.status, 400);
   });
 
-  // Teste Negativo 1: Token Errado
-  await test('Negativo 1: Webhook com token errado é rejeitado (401)', async () => {
-    const isTokenValid = secureCompareTokens(webhookToken, 'TOKEN_TOTALMENTE_ERRADO');
-    assert.strictEqual(isTokenValid, false);
-    const ord = await getOrderByOrderId(orderId);
-    assert.strictEqual(ord?.status, 'pending');
+  await test('Requisição com CPF com 11 dígitos iguais (11111111111) deve ser recusada com 400', async () => {
+    const req = new Request('https://ojvznzupiojimykqryhw.supabase.co/create', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ...validPayload, document: '11111111111' }),
+    });
+    const res = await handler(req);
+    assert.strictEqual(res.status, 400);
   });
 
-  // Teste Negativo 2: PAID sem COMPLETED
-  await test('Negativo 2: event===TRANSACTION_PAID mas status!==COMPLETED deve ser recusado', async () => {
-    const event: string = 'TRANSACTION_PAID';
-    const status: string = 'WAITING_PAYMENT'; // divergente
-    const paymentMethod: string = 'PIX';
+  await test('Requisição com quantidade zero ou maior que 10 deve ser recusada com 400', async () => {
+    const req0 = new Request('https://ojvznzupiojimykqryhw.supabase.co/create', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ...validPayload, quantity: 0 }),
+    });
+    const res0 = await handler(req0);
+    assert.strictEqual(res0.status, 400);
 
-    const isPaid = event === 'TRANSACTION_PAID' && status === 'COMPLETED' && paymentMethod === 'PIX';
-    assert.strictEqual(isPaid, false);
-    const ord = await getOrderByOrderId(orderId);
-    assert.strictEqual(ord?.status, 'pending');
+    const req11 = new Request('https://ojvznzupiojimykqryhw.supabase.co/create', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ...validPayload, quantity: 11 }),
+    });
+    const res11 = await handler(req11);
+    assert.strictEqual(res11.status, 400);
   });
 
-  // Teste Negativo 3: COMPLETED sem PAID
-  await test('Negativo 3: status===COMPLETED mas event!==TRANSACTION_PAID deve ser recusado', async () => {
-    const event: string = 'TRANSACTION_CREATED'; // divergente
-    const status: string = 'COMPLETED';
-    const paymentMethod: string = 'PIX';
-
-    const isPaid = event === 'TRANSACTION_PAID' && status === 'COMPLETED' && paymentMethod === 'PIX';
-    assert.strictEqual(isPaid, false);
-    const ord = await getOrderByOrderId(orderId);
-    assert.strictEqual(ord?.status, 'pending');
+  await test('Requisição com UF inexistente deve ser recusada com 400', async () => {
+    const req = new Request('https://ojvznzupiojimykqryhw.supabase.co/create', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ...validPayload, state: 'XX' }),
+    });
+    const res = await handler(req);
+    assert.strictEqual(res.status, 400);
   });
 
-  // Teste Negativo 4: Método errado
-  await test('Negativo 4: paymentMethod!==PIX (ex: CREDIT_CARD) deve ser recusado', async () => {
-    const event: string = 'TRANSACTION_PAID';
-    const status: string = 'COMPLETED';
-    const paymentMethod: string = 'CREDIT_CARD'; // divergente
-
-    const isPaid = event === 'TRANSACTION_PAID' && status === 'COMPLETED' && paymentMethod === 'PIX';
-    assert.strictEqual(isPaid, false);
-    const ord = await getOrderByOrderId(orderId);
-    assert.strictEqual(ord?.status, 'pending');
-  });
-
-  // Teste Negativo 5: Identificador inconsistente
-  await test('Negativo 5: transaction.identifier inconsistente com o pedido salvo deve ser recusado', async () => {
-    const incomingIdentifier: string = 'sig_outro_pedido_falsificado';
-    const matches = incomingIdentifier === baseOrder.identifier;
-    assert.strictEqual(matches, false);
-    const ord = await getOrderByOrderId(orderId);
-    assert.strictEqual(ord?.status, 'pending');
-  });
-
-  // Teste Negativo 6: Transaction ID inconsistente
-  await test('Negativo 6: transaction.id inconsistente com o pedido salvo deve ser recusado', async () => {
-    const incomingTxId: string = 'tx_falsa_99999';
-    const matches = incomingTxId === txId;
-    assert.strictEqual(matches, false);
-    const ord = await getOrderByOrderId(orderId);
-    assert.strictEqual(ord?.status, 'pending');
-  });
-
-  // Teste Negativo 7: Moeda errada
-  await test('Negativo 7: currency!==BRL (ex: USD) deve ser recusado', async () => {
-    const currency: string = 'USD';
-    const isBrl = currency === 'BRL';
-    assert.strictEqual(isBrl, false);
-    const ord = await getOrderByOrderId(orderId);
-    assert.strictEqual(ord?.status, 'pending');
-  });
-
-  // Teste Negativo 8: Valor errado
-  await test('Negativo 8: Valor divergente (ex: R$ 10,00 ao invés de R$ 49,90) deve ser recusado', async () => {
-    const incomingAmount = 10.0;
-    const incomingCents = Math.round(incomingAmount * 100);
-    const expectedCents = baseOrder.amount_cents; // 4990
-    assert.notStrictEqual(incomingCents, expectedCents);
-    const ord = await getOrderByOrderId(orderId);
-    assert.strictEqual(ord?.status, 'pending');
+  await test('Ausência de chaves Sigilo Pay deve abortar com 503 antes de tocar no banco', async () => {
+    const unconfiguredHandler = createCheckoutHandler({
+      supabaseClient: mockSupabase,
+      sigilopayPublicKey: '',
+      sigilopaySecretKey: '',
+    });
+    const req = new Request('https://ojvznzupiojimykqryhw.supabase.co/create', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(validPayload),
+    });
+    const res = await unconfiguredHandler(req);
+    assert.strictEqual(res.status, 503);
   });
 
   // ------------------------------------------------------------------------
-  // 5. TESTE POSITIVO E IDEMPOTÊNCIA DO WEBHOOK
+  // 3. FLUXO REAL DE CRIAÇÃO, PERSISTÊNCIA E IDEMPOTÊNCIA
   // ------------------------------------------------------------------------
-  console.log('\n✅ 5. Teste Positivo, Idempotência e Concorrência Fora de Ordem');
+  console.log('\n💳 3. Criação de Cobrança e Idempotência Estável');
 
-  await test('Positivo: Atendendo a TODOS os critérios estritos simultâneos marca pedido como PAGO', async () => {
-    const event = 'TRANSACTION_PAID';
-    const status = 'COMPLETED';
-    const paymentMethod = 'PIX';
-    const currency = 'BRL';
-    const incomingId = txId;
-    const incomingIdentifier = identifier;
-    const incomingAmount = 49.9;
-    const incomingToken = webhookToken;
+  let createdOrderId = '';
+  let createdGuestToken = validPayload.clientGuestToken;
 
-    // Checagem de token
-    assert(secureCompareTokens(webhookToken, incomingToken));
-
-    // Checagem de eventos estritos combinados
-    assert(event === 'TRANSACTION_PAID' && status === 'COMPLETED' && paymentMethod === 'PIX');
-    assert.strictEqual(currency, 'BRL');
-    assert.strictEqual(incomingId, txId);
-    assert.strictEqual(incomingIdentifier, identifier);
-    assert.strictEqual(Math.round(incomingAmount * 100), baseOrder.amount_cents);
-
-    // Executa confirmação atômica
-    const confirmResult = await confirmSigilopayPayment(txId, identifier, new Date().toISOString());
-    assert.strictEqual(confirmResult.success, true);
-    assert.strictEqual(confirmResult.action, 'PAYMENT_CONFIRMED');
-
-    const updated = await getOrderByOrderId(orderId);
-    assert.strictEqual(updated?.status, 'paid');
-    assert(updated?.paid_at !== null);
+  await test('Criação com dados válidos retorna Pix com expiresAt e orderId', async () => {
+    const req = new Request('https://ojvznzupiojimykqryhw.supabase.co/create', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(validPayload),
+    });
+    const res = await handler(req);
+    assert.strictEqual(res.status, 200);
+    const data = await res.json();
+    assert.strictEqual(data.success, true);
+    assert(data.orderId.startsWith('LS-'));
+    assert(data.pixCode.length > 10);
+    assert(data.expiresAt !== null);
+    createdOrderId = data.orderId;
   });
 
-  await test('Idempotência: Reenvio do mesmo webhook PAID já processado retorna ALREADY_PAID', async () => {
-    const secondCall = await confirmSigilopayPayment(txId, identifier);
-    assert.strictEqual(secondCall.success, true);
-    assert.strictEqual(secondCall.action, 'ALREADY_PAID');
-    const ord = await getOrderByOrderId(orderId);
-    assert.strictEqual(ord?.status, 'paid');
+  await test('Segunda chamada simultânea com mesma chave de idempotência reutiliza cobrança sem novo Pix', async () => {
+    const req = new Request('https://ojvznzupiojimykqryhw.supabase.co/create', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(validPayload),
+    });
+    const res = await handler(req);
+    assert.strictEqual(res.status, 200);
+    const data = await res.json();
+    assert.strictEqual(data.orderId, createdOrderId);
+    assert.strictEqual(data.guestToken, createdGuestToken);
   });
 
-  await test('Fora de Ordem: Webhook CANCELED após pedido PAGO não rebaixa status para cancelado', async () => {
-    await cancelOrRefundOrder(txId, identifier, 'canceled');
-    const ord = await getOrderByOrderId(orderId);
-    assert.strictEqual(ord?.status, 'paid'); // Permanece PAID!
+  await test('Consulta /status com o guestToken correto retorna pedido e não falha com 403', async () => {
+    const req = new Request(`https://ojvznzupiojimykqryhw.supabase.co/status?orderId=${createdOrderId}&token=${createdGuestToken}`, {
+      method: 'GET',
+    });
+    const res = await handler(req);
+    assert.strictEqual(res.status, 200);
+    const data = await res.json();
+    assert.strictEqual(data.orderId, createdOrderId);
+    assert.strictEqual(data.status, 'pending');
+    assert.strictEqual('customer_cpf' in data, false);
+  });
+
+  await test('Consulta /status com token errado retorna 403 Forbidden', async () => {
+    const req = new Request(`https://ojvznzupiojimykqryhw.supabase.co/status?orderId=${createdOrderId}&token=token_falsificado`, {
+      method: 'GET',
+    });
+    const res = await handler(req);
+    assert.strictEqual(res.status, 403);
   });
 
   // ------------------------------------------------------------------------
-  // 6. CONSULTA DE STATUS DO CONVIDADO E PRIVACIDADE
+  // 4. TESTES DE WEBHOOK (STRICT AND, RACE CONDITIONS, RETROCESSO)
   // ------------------------------------------------------------------------
-  console.log('\n🔒 6. Consulta de Status e Zero Exposição de Dados Pessoais');
+  console.log('\n⚡ 4. Webhook Oficial: Validação Estrita, Corrida e Estados Terminais');
 
-  await test('Guest token incorreto falha na verificação de hash', () => {
-    const hashInDb = guestHash;
-    const wrongTokenHash = sha256Hex('token_completamente_errado');
-    assert.strictEqual(secureCompareTokens(hashInDb, wrongTokenHash), false);
-  });
+  const orderRecord = dbOrders.get(createdOrderId);
+  const txId = orderRecord.transaction_id;
+  const ident = orderRecord.identifier;
+  const token = orderRecord.webhook_token;
 
-  await test('Objeto de resposta ao convidado contém apenas status mínimo seguro', () => {
-    const safeResponse = {
-      orderId,
-      status: 'paid',
-      paidAt: new Date().toISOString(),
-      totalPrice: 49.9,
-      quantity: 1,
-      includeCream: true,
-      pixCode: '000201...',
-      pixImage: 'https://sigilopay.com.br/qr.png',
+  await test('Webhook antes da persistência do webhook_token responde 503 com Retry-After', async () => {
+    const tempOrder = {
+      order_id: 'LS-TEMP-RACE',
+      identifier: 'sig_temp_race',
+      transaction_id: 'tx_race_1',
+      webhook_token: null, // Ainda não gravou o token
+      status: 'creating',
     };
+    dbOrders.set('LS-TEMP-RACE', tempOrder);
 
-    const leaks = ['customer_cpf', 'webhook_token', 'transaction_id', 'service_role', 'guest_token_hash'];
-    for (const leak of leaks) {
-      assert.strictEqual(leak in safeResponse, false);
-    }
+    const req = new Request('https://ojvznzupiojimykqryhw.supabase.co/webhook', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        event: 'TRANSACTION_PAID',
+        token: 'any_token',
+        transaction: { id: 'tx_race_1', identifier: 'sig_temp_race' },
+      }),
+    });
+    const res = await handler(req);
+    assert.strictEqual(res.status, 503);
+    assert.strictEqual(res.headers.get('Retry-After'), '3');
   });
 
-  // ------------------------------------------------------------------------
-  // 7. TRATAMENTO DE TIMEOUT E ESTADO INCERTO
-  // ------------------------------------------------------------------------
-  console.log('\n⏱️ 7. Tratamento de Timeout e Resiliência sem Credenciais');
-
-  await test('attachSigilopayCharge com falha/timeout registra status uncertain sem duplicar cobrança', async () => {
-    const timeoutOrder = `LS-TIMEOUT-${Date.now()}`;
-    const timeoutIdemKey = `idem_timeout_${Date.now()}`;
-
-    await createOrGetPendingOrder({
-      idempotencyKey: timeoutIdemKey,
-      orderId: timeoutOrder,
-      customerName: 'Cliente Timeout',
-      customerPhone: '11988887777',
-      customerCpf: '12345678902',
-      postalCode: '01310100',
-      street: 'Rua B',
-      houseNumber: '20',
-      district: 'Centro',
-      city: 'SP',
-      state: 'SP',
-      quantity: 1,
-      includeCream: false,
-      totalPrice: 34.9,
-      amountCents: 3490,
-      guestTokenHash: sha256Hex('tok_timeout'),
+  await test('Webhook com token incorreto retorna 401 Unauthorized', async () => {
+    const req = new Request('https://ojvznzupiojimykqryhw.supabase.co/webhook', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        event: 'TRANSACTION_PAID',
+        token: 'TOKEN_INCORRETO',
+        transaction: { id: txId, identifier: ident, status: 'COMPLETED', paymentMethod: 'PIX', currency: 'BRL', amount: 49.9 },
+      }),
     });
+    const res = await handler(req);
+    assert.strictEqual(res.status, 401);
+  });
 
-    const uncertain = await attachSigilopayCharge(timeoutOrder, {
-      identifier: 'sig_timeout_att_1',
-      gatewayStatus: 'TIMEOUT',
-      status: 'uncertain',
+  await test('Webhook com valor divergente retorna 400 Bad Request', async () => {
+    const req = new Request('https://ojvznzupiojimykqryhw.supabase.co/webhook', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        event: 'TRANSACTION_PAID',
+        token,
+        transaction: { id: txId, identifier: ident, status: 'COMPLETED', paymentMethod: 'PIX', currency: 'BRL', amount: 10.0 }, // 10.0 vs 49.9
+      }),
     });
+    const res = await handler(req);
+    assert.strictEqual(res.status, 400);
+  });
 
-    assert.strictEqual(uncertain?.status, 'uncertain');
+  await test('Webhook válido com todos os critérios estritos confirma pagamento 200 OK', async () => {
+    const req = new Request('https://ojvznzupiojimykqryhw.supabase.co/webhook', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        event: 'TRANSACTION_PAID',
+        token,
+        transaction: {
+          id: txId,
+          identifier: ident,
+          status: 'COMPLETED',
+          paymentMethod: 'PIX',
+          currency: 'BRL',
+          amount: 49.9,
+          payedAt: new Date().toISOString(),
+        },
+      }),
+    });
+    const res = await handler(req);
+    assert.strictEqual(res.status, 200);
+    const data = await res.json();
+    assert.strictEqual(data.status, 'paid_confirmed');
+    assert.strictEqual(orderRecord.status, 'paid');
+  });
+
+  await test('Webhook duplicado retorna 200 already_paid de forma idempotente', async () => {
+    const req = new Request('https://ojvznzupiojimykqryhw.supabase.co/webhook', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        event: 'TRANSACTION_PAID',
+        token,
+        transaction: { id: txId, identifier: ident, status: 'COMPLETED', paymentMethod: 'PIX', currency: 'BRL', amount: 49.9 },
+      }),
+    });
+    const res = await handler(req);
+    assert.strictEqual(res.status, 200);
+    const data = await res.json();
+    assert.strictEqual(data.status, 'already_paid');
+  });
+
+  await test('Tentativa de cancelar pedido já pago via TRANSACTION_CANCELED é recusada', async () => {
+    const req = new Request('https://ojvznzupiojimykqryhw.supabase.co/webhook', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        event: 'TRANSACTION_CANCELED',
+        token,
+        transaction: { id: txId, identifier: ident, status: 'CANCELED' },
+      }),
+    });
+    const res = await handler(req);
+    assert.strictEqual(res.status, 400);
+    assert.strictEqual(orderRecord.status, 'paid'); // Permanece PAID!
+  });
+
+  await test('Estorno via TRANSACTION_REFUNDED atualiza status para refunded', async () => {
+    const req = new Request('https://ojvznzupiojimykqryhw.supabase.co/webhook', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        event: 'TRANSACTION_REFUNDED',
+        token,
+        transaction: { id: txId, identifier: ident, status: 'REFUNDED' },
+      }),
+    });
+    const res = await handler(req);
+    assert.strictEqual(res.status, 200);
+    assert.strictEqual(orderRecord.status, 'refunded');
+  });
+
+  await test('Evento TRANSACTION_PAID tardio após REFUNDED é recusado e não volta para paid', async () => {
+    const req = new Request('https://ojvznzupiojimykqryhw.supabase.co/webhook', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        event: 'TRANSACTION_PAID',
+        token,
+        transaction: { id: txId, identifier: ident, status: 'COMPLETED', paymentMethod: 'PIX', currency: 'BRL', amount: 49.9 },
+      }),
+    });
+    const res = await handler(req);
+    assert.strictEqual(res.status, 400);
+    assert.strictEqual(orderRecord.status, 'refunded'); // Mantém REFUNDED!
   });
 
   console.log(`\n======================================================`);
-  console.log(`🎯 RESULTADO DOS TESTES: ${passed} Aprovados, ${failed} Falhas`);
+  console.log(`🎯 RESULTADO DOS TESTES DO HANDLER REAL: ${passed} Aprovados, ${failed} Falhas`);
   console.log(`======================================================\n`);
 
   if (failed > 0) process.exit(1);
 }
 
-runTests().catch((err) => {
+runEdgeFunctionTests().catch((err) => {
   console.error('Falha fatal na execução dos testes:', err);
   process.exit(1);
 });

@@ -19,13 +19,14 @@ export interface CreateChargeResponse {
 export interface OrderStatusResponse {
   success: boolean;
   orderId?: string;
-  status?: 'creating' | 'pending' | 'uncertain' | 'paid' | 'canceled' | 'refunded';
+  status?: 'creating' | 'pending' | 'uncertain' | 'paid' | 'canceled' | 'refunded' | 'charged_back';
   paidAt?: string | null;
   totalPrice?: number;
   quantity?: number;
   includeCream?: boolean;
   pixCode?: string;
   pixImage?: string | null;
+  expiresAt?: string | null;
   error?: string;
 }
 
@@ -34,18 +35,57 @@ export interface ConfigStatusResponse {
   supabaseConfigured: boolean;
 }
 
-// Em produção Cloudflare Pages, VITE_CHECKOUT_API_URL aponta para:
-// https://ojvznzupiojimykqryhw.supabase.co/functions/v1/checkout-api
 const API_BASE_URL = (import.meta.env.VITE_CHECKOUT_API_URL || '').replace(/\/$/, '');
+
+// Chave estável de idempotência por intenção de compra do cliente em sessionStorage (sem PII)
+export function getOrCreateCheckoutSessionKey(): string {
+  try {
+    let key = sessionStorage.getItem('landy_checkout_intent_id');
+    if (!key || key.length < 16) {
+      key = typeof crypto !== 'undefined' && crypto.randomUUID
+        ? crypto.randomUUID()
+        : 'intent_' + Math.random().toString(36).slice(2) + Date.now().toString(36);
+      sessionStorage.setItem('landy_checkout_intent_id', key);
+    }
+    return key;
+  } catch {
+    return 'intent_temp_' + Math.random().toString(36).slice(2);
+  }
+}
+
+// Token de convidado estável por intenção de compra em sessionStorage
+export function getOrCreateClientGuestToken(): string {
+  try {
+    let token = sessionStorage.getItem('landy_checkout_guest_token');
+    if (!token || token.length < 32) {
+      const part1 = typeof crypto !== 'undefined' && crypto.randomUUID
+        ? crypto.randomUUID().replace(/-/g, '')
+        : Math.random().toString(36).slice(2) + Math.random().toString(36).slice(2);
+      const part2 = typeof crypto !== 'undefined' && crypto.randomUUID
+        ? crypto.randomUUID().replace(/-/g, '')
+        : Date.now().toString(36) + Math.random().toString(36).slice(2);
+      token = (part1 + part2).slice(0, 48);
+      sessionStorage.setItem('landy_checkout_guest_token', token);
+    }
+    return token;
+  } catch {
+    return 'guest_tok_' + Math.random().toString(36).slice(2) + Date.now().toString(36);
+  }
+}
 
 export async function createCheckoutCharge(
   formData: CheckoutFormData,
   quantity: number,
   includeCream: boolean
 ): Promise<CreateChargeResponse> {
+  const idempotencyKey = getOrCreateCheckoutSessionKey();
+  const clientGuestToken = getOrCreateClientGuestToken();
+
   const payload = {
-    name: formData.name.trim(), // Preserva caracteres e espaços intactos
-    email: formData.email ? formData.email.trim().toLowerCase() : undefined,
+    idempotencyKey,
+    clientGuestToken,
+    name: formData.name.trim(),
+    email: formData.email ? formData.email.trim().toLowerCase() : '',
     phone: formData.phone.replace(/\D/g, ''),
     document: formData.document.replace(/\D/g, ''),
     postalCode: formData.postalCode.replace(/\D/g, ''),
