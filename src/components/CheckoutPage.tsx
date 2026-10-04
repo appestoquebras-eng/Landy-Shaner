@@ -798,7 +798,7 @@ export const CheckoutPage: React.FC<CheckoutPageProps> = ({
                         {quantity}x Kit Depilador 4 em 1
                       </p>
                       <p className="text-[11px] text-muted-foreground">
-                        R$ 1,50 cada
+                        R$ 34,90 cada
                       </p>
                     </div>
                   </div>
