@@ -116,7 +116,8 @@ export const OfferSection: React.FC<OfferSectionProps> = ({
 
                 <button
                   type="button"
-                  onClick={() => onQuantityChange(quantity + 1)}
+                  onClick={() => onQuantityChange(Math.min(10, quantity + 1))}
+                  disabled={quantity >= 10}
                   aria-label="Adicionar uma máquina"
                   className="cta-grad flex h-12 w-12 items-center justify-center rounded-full text-2xl font-extrabold text-primary-foreground shadow-lg shadow-primary/30 transition-transform active:scale-90 cursor-pointer"
                 >
