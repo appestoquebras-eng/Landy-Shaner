@@ -16,6 +16,7 @@ import {
 import confetti from 'canvas-confetti';
 import { PRODUCT_BASE_PRICE, CREAM_UPSELL_PRICE } from '../data/landingData';
 import { CheckoutFormData } from '../types';
+import { saveOrder } from '../lib/supabase';
 
 interface CheckoutPageProps {
   quantity: number;
@@ -156,9 +157,33 @@ export const CheckoutPage: React.FC<CheckoutPageProps> = ({
     }
 
     const randomNum = Math.floor(100000 + Math.random() * 900000);
-    setOrderId(`LS-${randomNum}`);
+    const newOrderId = `LS-${randomNum}`;
+    setOrderId(newOrderId);
     setIsGenerated(true);
     window.scrollTo({ top: 0, behavior: 'smooth' });
+
+    const currentPix = `00020126580014br.gov.bcb.pix0136landyshaner-${newOrderId}-depilador520400005303986540${totalPrice.toFixed(2)}5802BR5912LANDY SHANER6009SAO PAULO62070503***6304`;
+
+    saveOrder({
+      order_id: newOrderId,
+      customer_name: formData.name,
+      customer_email: formData.email,
+      customer_phone: formData.phone,
+      customer_cpf: formData.document,
+      postal_code: formData.postalCode,
+      street: formData.street,
+      number: formData.houseNumber,
+      complement: formData.complement,
+      district: formData.district,
+      city: formData.city,
+      state: formData.state,
+      quantity,
+      include_cream: cream,
+      total_price: totalPrice,
+      payment_method: 'pix',
+      status: 'pending',
+      pix_code: currentPix,
+    });
   };
 
   useEffect(() => {
@@ -184,6 +209,27 @@ export const CheckoutPage: React.FC<CheckoutPageProps> = ({
       particleCount: 100,
       spread: 70,
       origin: { y: 0.6 },
+    });
+
+    saveOrder({
+      order_id: orderId,
+      customer_name: formData.name,
+      customer_email: formData.email,
+      customer_phone: formData.phone,
+      customer_cpf: formData.document,
+      postal_code: formData.postalCode,
+      street: formData.street,
+      number: formData.houseNumber,
+      complement: formData.complement,
+      district: formData.district,
+      city: formData.city,
+      state: formData.state,
+      quantity,
+      include_cream: cream,
+      total_price: totalPrice,
+      payment_method: 'pix',
+      status: 'paid',
+      pix_code: pixCode,
     });
   };
 
