@@ -1,9 +1,10 @@
 export const PIXEL_ID = '1641693707389160';
 declare global { interface Window { fbq?: any; _fbq?: any; } }
-export function marketingAllowed() { try { return localStorage.getItem('landy_marketing') === 'yes'; } catch { return false; } }
+export function marketingAllowed() { try { return localStorage.getItem('landy_marketing') !== 'no'; } catch { return false; } }
 function cookie(name:string) { return document.cookie.split('; ').find(x=>x.startsWith(name+'='))?.slice(name.length+1); }
 export function trackingContext() {
- if (!marketingAllowed()) return { consent:false };
+ // Automatic browser tracking is not explicit permission to send contact data.
+ try { if (localStorage.getItem('landy_marketing') !== 'yes') return {consent:false}; } catch { return {consent:false}; }
  return {consent:true,fbp:cookie('_fbp'),fbc:cookie('_fbc'),userAgent:navigator.userAgent};
 }
 export function startPixel() {
