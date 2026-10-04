@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import {
   ArrowLeft,
   Lock,
@@ -11,12 +11,15 @@ import {
   AlertCircle,
   Clock,
   Sparkles,
-  ShoppingBag
+  ShoppingBag,
+  Loader2,
+  CheckCircle
 } from 'lucide-react';
 import confetti from 'canvas-confetti';
+import QRCode from 'qrcode';
 import { PRODUCT_BASE_PRICE, CREAM_UPSELL_PRICE } from '../data/landingData';
 import { CheckoutFormData } from '../types';
-import { saveOrder } from '../lib/supabase';
+import { createCheckoutCharge, checkOrderStatus } from '../lib/api';
 
 interface CheckoutPageProps {
   quantity: number;
@@ -49,11 +52,21 @@ export const CheckoutPage: React.FC<CheckoutPageProps> = ({
   const [errors, setErrors] = useState<Partial<Record<keyof CheckoutFormData, string>>>({});
 
   // Payment states
+  const [isSubmitting, setIsSubmitting] = useState<boolean>(false);
+  const [errorMessage, setErrorMessage] = useState<string | null>(null);
+  const [isConfigMissing, setIsConfigMissing] = useState<boolean>(false);
+
   const [isGenerated, setIsGenerated] = useState<boolean>(false);
   const [isPaid, setIsPaid] = useState<boolean>(false);
   const [copied, setCopied] = useState<boolean>(false);
   const [orderId, setOrderId] = useState<string>('');
+  const [guestToken, setGuestToken] = useState<string>('');
+  const [pixCode, setPixCode] = useState<string>('');
+  const [pixImage, setPixImage] = useState<string | null>(null);
+  const [qrCodeUrl, setQrCodeUrl] = useState<string>('');
   const [pixTimeLeft, setPixTimeLeft] = useState<number>(900); // 15 mins
+
+  const pollingRef = useRef<NodeJS.Timeout | null>(null);
 
   const totalPrice = quantity * PRODUCT_BASE_PRICE + (cream ? CREAM_UPSELL_PRICE : 0);
   const formattedTotal = totalPrice.toFixed(2).replace('.', ',');
@@ -137,7 +150,7 @@ export const CheckoutPage: React.FC<CheckoutPageProps> = ({
     }
     const cleanCep = formData.postalCode.replace(/\D/g, '');
     if (cleanCep.length !== 8) {
-      newErrors.postalCode = 'CEP inválido';
+      newErrors.postalCode = 'CEP inválido (8 dígitos)';
     }
     if (!formData.street.trim()) newErrors.street = 'Rua obrigatória';
     if (!formData.houseNumber.trim()) newErrors.houseNumber = 'Número obrigatório';
@@ -149,43 +162,69 @@ export const CheckoutPage: React.FC<CheckoutPageProps> = ({
     return Object.keys(newErrors).length === 0;
   };
 
-  const handleGeneratePix = (e: React.FormEvent) => {
+  const handleGeneratePix = async (e: React.FormEvent) => {
     e.preventDefault();
+    if (isSubmitting) return;
+
     if (!validate()) {
       window.scrollTo({ top: 120, behavior: 'smooth' });
       return;
     }
 
-    const randomNum = Math.floor(100000 + Math.random() * 900000);
-    const newOrderId = `LS-${randomNum}`;
-    setOrderId(newOrderId);
-    setIsGenerated(true);
-    window.scrollTo({ top: 0, behavior: 'smooth' });
+    setIsSubmitting(true);
+    setErrorMessage(null);
+    setIsConfigMissing(false);
 
-    const currentPix = `00020126580014br.gov.bcb.pix0136landyshaner-${newOrderId}-depilador520400005303986540${totalPrice.toFixed(2)}5802BR5912LANDY SHANER6009SAO PAULO62070503***6304`;
+    try {
+      const response = await createCheckoutCharge(formData, quantity, cream);
 
-    saveOrder({
-      order_id: newOrderId,
-      customer_name: formData.name,
-      customer_email: formData.email,
-      customer_phone: formData.phone,
-      customer_cpf: formData.document,
-      postal_code: formData.postalCode,
-      street: formData.street,
-      number: formData.houseNumber,
-      complement: formData.complement,
-      district: formData.district,
-      city: formData.city,
-      state: formData.state,
-      quantity,
-      include_cream: cream,
-      total_price: totalPrice,
-      payment_method: 'pix',
-      status: 'pending',
-      pix_code: currentPix,
-    });
+      if (!response.success) {
+        if (response.error?.errorCode === 'GATEWAY_NOT_CONFIGURED') {
+          setIsConfigMissing(true);
+          setErrorMessage(response.error.message);
+        } else {
+          setErrorMessage(
+            response.error?.message || 'Não foi possível gerar a cobrança Pix. Tente novamente.'
+          );
+        }
+        setIsSubmitting(false);
+        return;
+      }
+
+      if (response.orderId && response.guestToken && response.pixCode) {
+        setOrderId(response.orderId);
+        setGuestToken(response.guestToken);
+        setPixCode(response.pixCode);
+        if (response.pixImage) {
+          setPixImage(response.pixImage);
+        }
+
+        // Gerar QR code local em alta definição a partir do código Pix real
+        try {
+          const url = await QRCode.toDataURL(response.pixCode, {
+            width: 256,
+            margin: 1,
+            color: {
+              dark: '#000000',
+              light: '#ffffff',
+            },
+          });
+          setQrCodeUrl(url);
+        } catch (err) {
+          console.error('Erro ao renderizar QRCode:', err);
+        }
+
+        setIsGenerated(true);
+        window.scrollTo({ top: 0, behavior: 'smooth' });
+      }
+    } catch (err: any) {
+      setErrorMessage(err.message || 'Falha de conexão com o servidor ao gerar o Pix.');
+    } finally {
+      setIsSubmitting(false);
+    }
   };
 
+  // Timer decrescente do Pix (apenas informativo)
   useEffect(() => {
     if (!isGenerated || isPaid) return;
     const interval = setInterval(() => {
@@ -194,43 +233,38 @@ export const CheckoutPage: React.FC<CheckoutPageProps> = ({
     return () => clearInterval(interval);
   }, [isGenerated, isPaid]);
 
-  // Simulated Pix Payload
-  const pixCode = `00020126580014br.gov.bcb.pix0136landyshaner-${orderId || 'LS9921'}-depilador520400005303986540${totalPrice.toFixed(2)}5802BR5912LANDY SHANER6009SAO PAULO62070503***6304`;
+  // Acompanhamento automático de status do pedido via backend (polling a cada 4s)
+  useEffect(() => {
+    if (!isGenerated || isPaid || !orderId || !guestToken) return;
+
+    const poll = async () => {
+      try {
+        const res = await checkOrderStatus(orderId, guestToken);
+        if (res.success && res.status === 'paid') {
+          setIsPaid(true);
+          confetti({
+            particleCount: 120,
+            spread: 80,
+            origin: { y: 0.6 },
+          });
+          if (pollingRef.current) clearInterval(pollingRef.current);
+        }
+      } catch (err) {
+        // Falha transitória de consulta; tentará no próximo ciclo
+      }
+    };
+
+    pollingRef.current = setInterval(poll, 4000);
+    return () => {
+      if (pollingRef.current) clearInterval(pollingRef.current);
+    };
+  }, [isGenerated, isPaid, orderId, guestToken]);
 
   const handleCopyPix = () => {
+    if (!pixCode) return;
     navigator.clipboard.writeText(pixCode);
     setCopied(true);
     setTimeout(() => setCopied(false), 2500);
-  };
-
-  const handleConfirmSimulation = () => {
-    setIsPaid(true);
-    confetti({
-      particleCount: 100,
-      spread: 70,
-      origin: { y: 0.6 },
-    });
-
-    saveOrder({
-      order_id: orderId,
-      customer_name: formData.name,
-      customer_email: formData.email,
-      customer_phone: formData.phone,
-      customer_cpf: formData.document,
-      postal_code: formData.postalCode,
-      street: formData.street,
-      number: formData.houseNumber,
-      complement: formData.complement,
-      district: formData.district,
-      city: formData.city,
-      state: formData.state,
-      quantity,
-      include_cream: cream,
-      total_price: totalPrice,
-      payment_method: 'pix',
-      status: 'paid',
-      pix_code: pixCode,
-    });
   };
 
   const formatPixTimer = (sec: number) => {
@@ -277,39 +311,55 @@ export const CheckoutPage: React.FC<CheckoutPageProps> = ({
           {isPaid
             ? 'Pedido Confirmado com Sucesso!'
             : isGenerated
-            ? 'Aguardando pagamento Pix'
-            : 'Finalizar Pedido!'}
+            ? 'Aguardando confirmação do Pix'
+            : 'Finalizar Pedido'}
         </h1>
+
+        {/* Global Error Banner */}
+        {errorMessage && (
+          <div className="mt-4 rounded-2xl border border-destructive/30 bg-destructive/10 p-4 text-destructive flex items-start gap-3">
+            <AlertCircle className="h-5 w-5 shrink-0 mt-0.5" />
+            <div className="text-xs sm:text-sm leading-relaxed">
+              <strong>{isConfigMissing ? 'Atenção na Configuração:' : 'Erro no processamento:'}</strong>{' '}
+              {errorMessage}
+            </div>
+          </div>
+        )}
 
         <div className="mt-8 grid min-w-0 items-start gap-8 lg:grid-cols-[minmax(0,1fr)_380px]">
           {/* Left Column: Form or Pix Display */}
           <div className="min-w-0">
             {isPaid ? (
-              /* Success Screen */
+              /* Success Screen (Confirmed ONLY by server state) */
               <div className="rounded-3xl border border-emerald-200 bg-card p-6 sm:p-8 shadow-xl text-center">
                 <div className="mx-auto flex h-16 w-16 items-center justify-center rounded-full bg-emerald-100 text-emerald-600">
                   <CheckCircle2 className="h-10 w-10" />
                 </div>
                 <h2 className="mt-5 font-display text-2xl font-extrabold text-foreground sm:text-3xl">
-                  Parabéns, {formData.name.split(' ')[0]}!
+                  Pagamento Confirmado!
                 </h2>
                 <p className="mt-2 text-sm text-muted-foreground sm:text-base">
-                  Seu pagamento de <strong>R$ {formattedTotal}</strong> foi aprovado instantaneamente.
+                  Recebemos a confirmação do seu pagamento de <strong>R$ {formattedTotal}</strong> com sucesso.
                 </p>
 
-                <div className="mt-6 rounded-2xl border border-border bg-secondary/50 p-4 text-left">
+                <div className="mt-6 rounded-2xl border border-border bg-secondary/50 p-4 text-left space-y-2">
                   <p className="text-xs font-semibold text-muted-foreground uppercase">
                     Código do pedido: <strong className="text-foreground">{orderId}</strong>
                   </p>
-                  <p className="mt-1 text-sm text-foreground">
-                    Enviaremos o código de rastreio para o seu WhatsApp{' '}
-                    <strong>{formData.phone}</strong> e por e-mail assim que despachado (em até 24h).
+                  <p className="text-sm text-foreground">
+                    Enviaremos o código de rastreamento para o seu WhatsApp{' '}
+                    <strong>{formData.phone}</strong> assim que o kit for postado nos Correios (preparação de envio em andamento).
                   </p>
-                  <div className="mt-3 border-t border-border/60 pt-3 text-xs text-muted-foreground">
+                  <div className="border-t border-border/60 pt-2 text-xs text-muted-foreground">
                     <strong>Endereço de entrega:</strong> {formData.street}, {formData.houseNumber}{' '}
                     {formData.complement && `- ${formData.complement}`}, {formData.district} —{' '}
                     {formData.city}/{formData.state} ({formData.postalCode})
                   </div>
+                </div>
+
+                <div className="mt-4 rounded-xl bg-emerald-50 border border-emerald-200 p-3 text-xs text-emerald-800 flex items-center justify-center gap-2">
+                  <Truck className="h-4 w-4 shrink-0 text-emerald-600" />
+                  <span>Seu pedido já foi enviado para a esteira de separação e expedição prioritária.</span>
                 </div>
 
                 <button
@@ -322,14 +372,14 @@ export const CheckoutPage: React.FC<CheckoutPageProps> = ({
               </div>
             ) : isGenerated ? (
               /* Waiting for Pix Payment Screen */
-              <div className="rounded-3xl border border-border bg-card p-6 shadow-xl">
+              <div className="rounded-3xl border border-border bg-card p-5 sm:p-6 shadow-xl">
                 <div className="flex items-center justify-between border-b border-border/60 pb-4">
                   <div>
                     <p className="font-display text-lg font-bold text-foreground">
-                      Pague R$ {formattedTotal} no seu banco
+                      Pague R$ {formattedTotal} via Pix
                     </p>
                     <p className="text-xs text-muted-foreground">
-                      Aprovação imediata · Pedido {orderId}
+                      Pedido {orderId} · Sigilo Pay
                     </p>
                   </div>
                   <div className="flex items-center gap-1.5 rounded-full bg-amber-50 px-3 py-1 text-xs font-bold text-amber-700 border border-amber-200">
@@ -338,27 +388,45 @@ export const CheckoutPage: React.FC<CheckoutPageProps> = ({
                   </div>
                 </div>
 
-                {/* QR Code and Pix instructions */}
-                <div className="mt-6 flex flex-col items-center justify-center p-4">
+                {/* Status indicator: polling backend */}
+                <div className="mt-4 flex items-center justify-center gap-2 rounded-xl bg-primary/5 p-3 text-xs font-semibold text-primary border border-primary/20">
+                  <span className="relative flex h-2.5 w-2.5">
+                    <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-primary opacity-75"></span>
+                    <span className="relative inline-flex rounded-full h-2.5 w-2.5 bg-primary"></span>
+                  </span>
+                  <span>Aguardando confirmação do banco... (reconhecimento automático)</span>
+                </div>
+
+                {/* QR Code */}
+                <div className="mt-5 flex flex-col items-center justify-center p-3">
                   <div className="rounded-2xl border-2 border-primary/30 p-3 bg-white shadow-md">
-                    {/* Visual QR Code Image using public QR API */}
-                    <img
-                      src={`https://api.qrserver.com/v1/create-qr-code/?size=200x200&data=${encodeURIComponent(
-                        pixCode
-                      )}`}
-                      alt="QR Code Pix"
-                      className="h-48 w-48 object-contain"
-                    />
+                    {pixImage ? (
+                      <img
+                        src={pixImage}
+                        alt="QR Code Pix"
+                        className="h-48 w-48 object-contain"
+                      />
+                    ) : qrCodeUrl ? (
+                      <img
+                        src={qrCodeUrl}
+                        alt="QR Code Pix"
+                        className="h-48 w-48 object-contain"
+                      />
+                    ) : (
+                      <div className="h-48 w-48 flex items-center justify-center bg-secondary/30 rounded-xl">
+                        <Loader2 className="h-8 w-8 animate-spin text-primary" />
+                      </div>
+                    )}
                   </div>
                   <p className="mt-3 text-xs font-medium text-muted-foreground text-center">
-                    Abra o app do seu banco e escaneie o QR Code acima
+                    Abra o app do seu banco e aponte a câmera para o QR Code acima
                   </p>
                 </div>
 
                 {/* Pix Copia e Cola */}
                 <div className="mt-4">
                   <label className="text-xs font-bold text-foreground block mb-1">
-                    Ou use o Pix Copia e Cola:
+                    Ou copie o código Pix abaixo:
                   </label>
                   <div className="flex items-center gap-2">
                     <input
@@ -388,32 +456,26 @@ export const CheckoutPage: React.FC<CheckoutPageProps> = ({
                 {/* Step by step */}
                 <div className="mt-6 rounded-2xl bg-secondary/40 p-4">
                   <p className="text-xs font-extrabold uppercase text-foreground">
-                    Passo a passo rápido:
+                    Como pagar:
                   </p>
                   <ol className="mt-2 space-y-1.5 text-xs text-muted-foreground list-decimal pl-4">
                     <li>Copie o código acima ou escaneie o QR Code no seu banco</li>
-                    <li>No app do seu banco, escolha a opção <strong>Pix Copia e Cola</strong></li>
-                    <li>Confirme os dados e finalize a transferência</li>
-                    <li>A confirmação acontece em poucos segundos de forma automática</li>
+                    <li>No app do seu banco, escolha <strong>Pix Copia e Cola</strong></li>
+                    <li>Confirme o valor de <strong>R$ {formattedTotal}</strong> e finalize</li>
+                    <li>Esta tela atualizará automaticamente assim que o pagamento for registrado</li>
                   </ol>
                 </div>
 
-                {/* Confirmation Simulator Button */}
-                <div className="mt-6 pt-4 border-t border-border flex flex-col sm:flex-row gap-3 items-center justify-between">
+                <div className="mt-6 pt-4 border-t border-border flex items-center justify-between">
                   <button
                     type="button"
-                    onClick={handleConfirmSimulation}
-                    className="w-full sm:w-auto cta-grad rounded-xl px-6 py-3 text-xs font-extrabold uppercase tracking-wider text-primary-foreground shadow-lg shadow-primary/20 cursor-pointer text-center"
-                  >
-                    Simular Aprovação Imediata ✓
-                  </button>
-
-                  <button
-                    type="button"
-                    onClick={() => setIsGenerated(false)}
+                    onClick={() => {
+                      setIsGenerated(false);
+                      setErrorMessage(null);
+                    }}
                     className="text-xs text-muted-foreground hover:text-foreground underline cursor-pointer"
                   >
-                    Alterar dados de entrega
+                    ← Alterar dados de entrega
                   </button>
                 </div>
               </div>
@@ -634,12 +696,22 @@ export const CheckoutPage: React.FC<CheckoutPageProps> = ({
                   </div>
                 </div>
 
-                {/* Submit button */}
+                {/* Submit button with double-click protection */}
                 <button
                   type="submit"
-                  className="cta-grad w-full rounded-2xl px-6 py-4 text-base sm:text-lg font-extrabold uppercase tracking-wide text-primary-foreground shadow-xl shadow-primary/30 transition-transform hover:scale-[1.02] active:scale-95 cursor-pointer text-center"
+                  disabled={isSubmitting}
+                  className={`cta-grad w-full rounded-2xl px-6 py-4 text-base sm:text-lg font-extrabold uppercase tracking-wide text-primary-foreground shadow-xl shadow-primary/30 transition-transform ${
+                    isSubmitting ? 'opacity-80 cursor-wait' : 'hover:scale-[1.02] active:scale-95 cursor-pointer'
+                  } text-center flex items-center justify-center gap-2`}
                 >
-                  Gerar Pix — R$ {formattedTotal}
+                  {isSubmitting ? (
+                    <>
+                      <Loader2 className="h-5 w-5 animate-spin" />
+                      <span>Gerando Pix Seguro...</span>
+                    </>
+                  ) : (
+                    <span>Gerar Pix — R$ {formattedTotal}</span>
+                  )}
                 </button>
               </form>
             )}

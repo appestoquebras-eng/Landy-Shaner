@@ -1,11 +1,13 @@
 -- =========================================================================
--- ESQUEMA SEGURO SUPABASE & ATOMIC RPCS - LANDY SHANER & SIGILO PAY
--- Copie e cole no SQL Editor do Supabase (https://ojvznzupiojimykqryhw.supabase.co)
--- Compatível com banco vazio ou já existente.
+-- MIGRATION: 20261004000000_secure_orders_and_rpc.sql
+-- Projeto: Landy Shaner & Sigilo Pay
+-- Compatibilidade: Executável em banco totalmente vazio ou com tabela existente.
 -- =========================================================================
 
+-- 1. Extensão para UUIDs (se não existir)
 CREATE EXTENSION IF NOT EXISTS "pgcrypto";
 
+-- 2. Tabela principal de pedidos (orders)
 CREATE TABLE IF NOT EXISTS public.orders (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     order_id TEXT NOT NULL UNIQUE,
@@ -40,6 +42,7 @@ CREATE TABLE IF NOT EXISTS public.orders (
     updated_at TIMESTAMP WITH TIME ZONE DEFAULT timezone('utc'::text, now()) NOT NULL
 );
 
+-- Garantir adição de colunas caso a tabela já tenha sido criada previamente com esquema antigo
 DO $$
 BEGIN
     IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema='public' AND table_name='orders' AND column_name='idempotency_key') THEN
@@ -77,12 +80,15 @@ BEGIN
     END IF;
 END $$;
 
+-- 3. Índices de alta performance
 CREATE INDEX IF NOT EXISTS idx_orders_order_id ON public.orders (order_id);
 CREATE INDEX IF NOT EXISTS idx_orders_identifier ON public.orders (identifier);
 CREATE INDEX IF NOT EXISTS idx_orders_transaction_id ON public.orders (transaction_id);
 CREATE INDEX IF NOT EXISTS idx_orders_idempotency_key ON public.orders (idempotency_key);
 CREATE INDEX IF NOT EXISTS idx_orders_guest_token_hash ON public.orders (guest_token_hash);
+CREATE INDEX IF NOT EXISTS idx_orders_customer_recent ON public.orders (customer_cpf, created_at);
 
+-- 4. Revogar todas as permissões públicas antigas e ativar RLS estrito
 ALTER TABLE public.orders ENABLE ROW LEVEL SECURITY;
 
 DROP POLICY IF EXISTS "Permitir insercao anonima de pedidos" ON public.orders;
@@ -91,7 +97,10 @@ DROP POLICY IF EXISTS "Permitir leitura pública" ON public.orders;
 DROP POLICY IF EXISTS "Permitir escrita pública" ON public.orders;
 DROP POLICY IF EXISTS "Acesso exclusivo service_role" ON public.orders;
 
+-- Revoga grants diretos de anon e authenticated na tabela orders
 REVOKE ALL ON TABLE public.orders FROM anon, authenticated;
+
+-- Concede acesso total somente para service_role (Edge Functions e backend autenticado)
 GRANT ALL ON TABLE public.orders TO service_role;
 
 CREATE POLICY "Acesso exclusivo service_role"
@@ -101,7 +110,9 @@ TO service_role
 USING (true)
 WITH CHECK (true);
 
--- RPC 1: Criar ou obter pendente
+-- =========================================================================
+-- 5. RPC ATÔMICO: Criar ou Obter Cobrança Pendente com Desduplicação Durável
+-- =========================================================================
 CREATE OR REPLACE FUNCTION public.rpc_create_or_get_pending_order(
     p_idempotency_key TEXT,
     p_order_id TEXT,
@@ -138,6 +149,7 @@ AS $$
 DECLARE
     v_existing_order RECORD;
 BEGIN
+    -- 1. Verifica se já existe um pedido ativo idêntico para a chave de idempotência recente (últimos 15 min)
     SELECT o.order_id, o.identifier, o.status, o.pix_code, o.pix_image, o.total_price
     INTO v_existing_order
     FROM public.orders o
@@ -159,6 +171,7 @@ BEGIN
         RETURN;
     END IF;
 
+    -- 2. Cria o registro preliminar em estado 'creating'
     INSERT INTO public.orders (
         order_id,
         idempotency_key,
@@ -220,10 +233,13 @@ BEGIN
 END;
 $$;
 
+-- Restringe execução da função de criação apenas a service_role
 REVOKE ALL ON FUNCTION public.rpc_create_or_get_pending_order FROM PUBLIC, anon, authenticated;
 GRANT EXECUTE ON FUNCTION public.rpc_create_or_get_pending_order TO service_role;
 
--- RPC 2: Anexar dados do gateway
+-- =========================================================================
+-- 6. RPC ATÔMICO: Atualizar Pedido com Dados da Cobrança Sigilo Pay
+-- =========================================================================
 CREATE OR REPLACE FUNCTION public.rpc_attach_sigilopay_charge(
     p_order_id TEXT,
     p_identifier TEXT,
@@ -258,7 +274,9 @@ $$;
 REVOKE ALL ON FUNCTION public.rpc_attach_sigilopay_charge FROM PUBLIC, anon, authenticated;
 GRANT EXECUTE ON FUNCTION public.rpc_attach_sigilopay_charge TO service_role;
 
--- RPC 3: Confirmar pagamento
+-- =========================================================================
+-- 7. RPC ATÔMICO: Confirmação Idempotente de Pagamento via Webhook
+-- =========================================================================
 CREATE OR REPLACE FUNCTION public.rpc_confirm_sigilopay_payment(
     p_transaction_id TEXT,
     p_identifier TEXT,
@@ -278,6 +296,7 @@ AS $$
 DECLARE
     v_order RECORD;
 BEGIN
+    -- Bloqueia a linha da ordem com FOR UPDATE para evitar corridas
     SELECT o.id, o.order_id, o.status, o.amount_cents
     INTO v_order
     FROM public.orders o
@@ -290,11 +309,13 @@ BEGIN
         RETURN;
     END IF;
 
+    -- Se já estiver pago, retorna de forma idempotente sem alterar
     IF v_order.status = 'paid' THEN
         RETURN QUERY SELECT TRUE, 'ALREADY_PAID', v_order.order_id, v_order.status;
         RETURN;
     END IF;
 
+    -- Atualiza atomicamente para 'paid'
     UPDATE public.orders
     SET status = 'paid',
         paid_at = COALESCE(p_payed_at, now()),
@@ -309,7 +330,9 @@ $$;
 REVOKE ALL ON FUNCTION public.rpc_confirm_sigilopay_payment FROM PUBLIC, anon, authenticated;
 GRANT EXECUTE ON FUNCTION public.rpc_confirm_sigilopay_payment TO service_role;
 
--- RPC 4: Cancelamento / Estorno
+-- =========================================================================
+-- 8. RPC ATÔMICO: Cancelamento / Estorno Idempotente
+-- =========================================================================
 CREATE OR REPLACE FUNCTION public.rpc_update_order_cancellation(
     p_transaction_id TEXT,
     p_identifier TEXT,
@@ -340,6 +363,7 @@ BEGIN
         RETURN;
     END IF;
 
+    -- Se já está pago, não permite transição para cancelado (apenas refund se aplicável)
     IF v_order.status = 'paid' AND p_new_status = 'canceled' THEN
         RETURN QUERY SELECT TRUE, v_order.order_id, v_order.status;
         RETURN;

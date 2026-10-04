@@ -28,11 +28,11 @@ export const Navbar: React.FC<NavbarProps> = ({ onBuyClick }) => {
           </div>
         </a>
 
-        <div className="flex items-center gap-3">
+        <div className="flex items-center gap-3 shrink-0">
           <button
             onClick={onBuyClick}
             type="button"
-            className="cta-grad rounded-full px-5 py-2.5 text-xs sm:text-sm font-bold text-primary-foreground shadow-lg shadow-primary/25 transition-transform hover:scale-[1.03] active:scale-95 cursor-pointer"
+            className="cta-grad whitespace-nowrap shrink-0 rounded-full px-4 py-2 sm:px-5 sm:py-2.5 text-xs sm:text-sm font-bold text-primary-foreground shadow-lg shadow-primary/25 transition-transform hover:scale-[1.03] active:scale-95 cursor-pointer"
           >
             Comprar agora
           </button>
