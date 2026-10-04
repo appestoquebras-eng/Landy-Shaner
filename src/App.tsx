@@ -1,4 +1,6 @@
 import {track} from './lib/meta';
+import {AdminPanel} from './components/AdminPanel';
+import {recordStoreEvent} from './lib/storeAnalytics';
 /**
  * @license
  * SPDX-License-Identifier: Apache-2.0
@@ -26,6 +28,7 @@ export default function App() {
   const [quantity, setQuantity] = useState<number>(1);
   const [includeCream, setIncludeCream] = useState<boolean>(false);
   const [isUpsellOpen, setIsUpsellOpen] = useState<boolean>(false);
+  useEffect(()=>{recordStoreEvent(currentPage==='checkout'?'checkout':'visit');},[currentPage]);
 
   // Sync with browser back button or hash
   useEffect(() => {
@@ -74,6 +77,7 @@ export default function App() {
     }
   };
 
+  if (window.location.pathname.replace(/\/$/,'') === '/painel') return <AdminPanel />;
   if (currentPage === 'checkout') {
     return (
       <CheckoutPage

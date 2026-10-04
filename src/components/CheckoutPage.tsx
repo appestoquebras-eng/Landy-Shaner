@@ -1,4 +1,6 @@
 import {trackPurchase} from '../lib/meta';
+import {deliveryWindow} from '../lib/delivery';
+import {recordPixCopy} from '../lib/storeAnalytics';
 import React, { useState, useEffect, useRef } from 'react';
 import {
   ArrowLeft,
@@ -76,6 +78,8 @@ export const CheckoutPage: React.FC<CheckoutPageProps> = ({
 
   const [cepLoading, setCepLoading] = useState<boolean>(false);
   const [cepMessage, setCepMessage] = useState<string>('');
+  const [deliveryReady,setDeliveryReady]=useState(false);
+  const cepRequest=useRef(0);
   const [errors, setErrors] = useState<Partial<Record<keyof CheckoutFormData, string>>>({});
 
   // Payment states
@@ -124,6 +128,7 @@ export const CheckoutPage: React.FC<CheckoutPageProps> = ({
     if (field === 'phone') formatted = maskPhone(value);
     if (field === 'document') formatted = maskCPF(value);
     if (field === 'postalCode') {
+      setDeliveryReady(false);setCepLoading(false);setCepMessage('');cepRequest.current++;
       formatted = maskCEP(value);
       const digits = value.replace(/\D/g, '');
       if (digits.length === 8) {
@@ -138,11 +143,13 @@ export const CheckoutPage: React.FC<CheckoutPageProps> = ({
   };
 
   const lookupCep = async (cleanCep: string) => {
+    const request=++cepRequest.current;
     setCepLoading(true);
-    setCepMessage('Buscando endereço...');
+    setCepMessage('Calculando a estimativa de entrega…');
     try {
       const res = await fetch(`https://viacep.com.br/ws/${cleanCep}/json/`);
       const data = await res.json();
+      if(request!==cepRequest.current)return;
       if (data.erro) {
         setCepMessage('CEP não encontrado. Preencha o endereço manualmente.');
       } else {
@@ -153,12 +160,13 @@ export const CheckoutPage: React.FC<CheckoutPageProps> = ({
           city: data.localidade || prev.city,
           state: data.uf || prev.state,
         }));
-        setCepMessage('Endereço encontrado.');
+        setDeliveryReady(true);setCepMessage('');
       }
     } catch {
+      if(request!==cepRequest.current)return;
       setCepMessage('Preencha os dados do endereço manualmente.');
     } finally {
-      setCepLoading(false);
+      if(request===cepRequest.current)setCepLoading(false);
     }
   };
 
@@ -221,6 +229,7 @@ export const CheckoutPage: React.FC<CheckoutPageProps> = ({
       }
 
       if (response.status === 'paid') {
+        setOrderId(response.orderId||'');
         trackPurchase(response.orderId||'',Number(response.totalPrice));
         setIsPaid(true);
         confetti({
@@ -232,7 +241,7 @@ export const CheckoutPage: React.FC<CheckoutPageProps> = ({
       }
 
       if (response.status === 'uncertain') {
-        setErrorMessage('Sua cobrança está sendo confirmada com o gateway. Aguarde alguns instantes sem recriar o pedido.');
+        setErrorMessage('Estamos preparando seu Pix. Aguarde alguns instantes antes de tentar novamente.');
         setIsSubmitting(false);
         return;
       }
@@ -315,11 +324,9 @@ export const CheckoutPage: React.FC<CheckoutPageProps> = ({
     };
   }, [isGenerated, isPaid, orderId, guestToken]);
 
-  const handleCopyPix = () => {
+  const handleCopyPix = async () => {
     if (!pixCode) return;
-    navigator.clipboard.writeText(pixCode);
-    setCopied(true);
-    setTimeout(() => setCopied(false), 2500);
+    try {await navigator.clipboard.writeText(pixCode);setCopied(true);void recordPixCopy(orderId,guestToken);setTimeout(()=>setCopied(false),2500);}catch{setErrorMessage('Não foi possível copiar automaticamente. Selecione o código Pix e copie manualmente.');}
   };
 
   const formatPixTimer = (sec: number) => {
@@ -360,23 +367,25 @@ export const CheckoutPage: React.FC<CheckoutPageProps> = ({
 
       <div className="mx-auto max-w-6xl px-4 py-8">
         <p className="text-xs sm:text-sm font-bold uppercase tracking-wider text-primary">
-          Pagamento seguro · Passo final
+          {isPaid?'Obrigada por escolher a Landy Shaner':isGenerated?'Falta apenas o pagamento':'Sua compra, com tranquilidade'}
         </p>
         <h1 className="mt-1 font-display text-2xl font-extrabold sm:text-3xl text-foreground">
           {isPaid
-            ? 'Pedido Confirmado com Sucesso!'
+            ? 'Seu pedido está confirmado'
             : isGenerated
-            ? 'Aguardando confirmação do Pix'
-            : 'Finalizar Pedido'}
+            ? 'Finalize com Pix'
+            : 'Você está a um passo do seu kit'}
         </h1>
+        <p className="mt-3 text-sm text-muted-foreground max-w-xl">{isPaid?'Pagamento recebido. Agora vamos preparar seu pedido com cuidado.':isGenerated?'Copie o código ou escaneie o QR Code. A confirmação aparece aqui automaticamente.':'Preencha seus dados, confira a entrega e pague com Pix. Frete grátis, sem surpresas no total.'}</p>
+        {!isPaid&&<div className="mt-6 flex flex-wrap gap-x-6 gap-y-3 text-xs font-semibold text-muted-foreground"><span className="flex gap-2 items-center"><Lock size={16} className="text-emerald-600"/> Conexão protegida</span><span className="flex gap-2 items-center"><Truck size={16} className="text-primary"/> Envio no mesmo dia ou próximo dia útil</span><span className="flex gap-2 items-center"><ShieldCheck size={16} className="text-primary"/> Garantia de 30 dias</span></div>}
 
         {/* Global Error Banner */}
         {errorMessage && (
           <div className="mt-4 rounded-2xl border border-destructive/30 bg-destructive/10 p-4 text-destructive flex items-start gap-3">
             <AlertCircle className="h-5 w-5 shrink-0 mt-0.5" />
             <div className="text-xs sm:text-sm leading-relaxed">
-              <strong>{isConfigMissing ? 'Atenção na Configuração:' : 'Erro no processamento:'}</strong>{' '}
-              {errorMessage}
+              <strong>Não conseguimos concluir esta etapa.</strong>{' '}
+              {isConfigMissing?'O pagamento está temporariamente indisponível. Tente novamente em alguns minutos.':errorMessage}
             </div>
           </div>
         )}
@@ -391,7 +400,7 @@ export const CheckoutPage: React.FC<CheckoutPageProps> = ({
                   <CheckCircle2 className="h-10 w-10" />
                 </div>
                 <h2 className="mt-5 font-display text-2xl font-extrabold text-foreground sm:text-3xl">
-                  Pagamento Confirmado!
+                  Obrigada pela sua compra!
                 </h2>
                 <p className="mt-2 text-sm text-muted-foreground sm:text-base">
                   Recebemos a confirmação do seu pagamento de <strong>R$ {formattedTotal}</strong> com sucesso.
@@ -402,8 +411,7 @@ export const CheckoutPage: React.FC<CheckoutPageProps> = ({
                     Código do pedido: <strong className="text-foreground">{orderId}</strong>
                   </p>
                   <p className="text-sm text-foreground">
-                    Enviaremos o código de rastreamento para o seu WhatsApp{' '}
-                    <strong>{formData.phone}</strong> assim que o kit for postado nos Correios (preparação de envio em andamento).
+                    Seu kit será preparado para envio no mesmo dia ou no próximo dia útil. O código de rastreamento será informado após a postagem.
                   </p>
                   <div className="border-t border-border/60 pt-2 text-xs text-muted-foreground">
                     <strong>Endereço de entrega:</strong> {formData.street}, {formData.houseNumber}{' '}
@@ -414,8 +422,10 @@ export const CheckoutPage: React.FC<CheckoutPageProps> = ({
 
                 <div className="mt-4 rounded-xl bg-emerald-50 border border-emerald-200 p-3 text-xs text-emerald-800 flex items-center justify-center gap-2">
                   <Truck className="h-4 w-4 shrink-0 text-emerald-600" />
-                  <span>Seu pedido já foi enviado para a esteira de separação e expedição prioritária.</span>
+                  <span>Entrega estimada em 2 dias úteis após a postagem. Previsão: <strong>{deliveryWindow()}</strong>.</span>
                 </div>
+                <div className="mt-6 grid grid-cols-3 gap-2 text-xs text-left"><div className="rounded-xl bg-emerald-50 p-3"><CheckCircle2 size={20} className="text-emerald-600 mb-2"/><strong>1. Pago</strong><p className="mt-1 text-muted-foreground">Confirmado</p></div><div className="rounded-xl bg-secondary/50 p-3"><ShoppingBag size={20} className="text-primary mb-2"/><strong>2. Preparação</strong><p className="mt-1 text-muted-foreground">Próxima etapa</p></div><div className="rounded-xl bg-muted p-3"><Truck size={20} className="text-muted-foreground mb-2"/><strong>3. Entrega</strong><p className="mt-1 text-muted-foreground">Após postagem</p></div></div>
+                <p className="mt-4 text-xs text-muted-foreground">Guarde o número do pedido para acompanhar sua compra. O prazo de entrega é uma estimativa e pode variar conforme a região e a transportadora.</p>
 
                 <button
                   type="button"
@@ -434,7 +444,7 @@ export const CheckoutPage: React.FC<CheckoutPageProps> = ({
                       Pague R$ {formattedTotal} via Pix
                     </p>
                     <p className="text-xs text-muted-foreground">
-                      Pedido {orderId} · Sigilo Pay
+                      Pedido {orderId}
                     </p>
                   </div>
                   <div className="flex items-center gap-1.5 rounded-full bg-amber-50 px-3 py-1 text-xs font-bold text-amber-700 border border-amber-200">
@@ -449,7 +459,7 @@ export const CheckoutPage: React.FC<CheckoutPageProps> = ({
                     <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-primary opacity-75"></span>
                     <span className="relative inline-flex rounded-full h-2.5 w-2.5 bg-primary"></span>
                   </span>
-                  <span>Aguardando confirmação do banco... (reconhecimento automático)</span>
+                  <span>{pixTimeLeft>0?'Aguardando seu pagamento. Confirmação automática.':'O prazo deste Pix terminou. Verifique no seu banco antes de tentar novamente.'}</span>
                 </div>
 
                 {/* QR Code */}
@@ -656,6 +666,7 @@ export const CheckoutPage: React.FC<CheckoutPageProps> = ({
                       {errors.postalCode && (
                         <p className="mt-1 text-xs text-destructive">{errors.postalCode}</p>
                       )}
+                      {deliveryReady&&<div role="status" className="mt-3 rounded-xl bg-emerald-50 border border-emerald-100 p-3 text-xs text-emerald-900"><p className="font-bold flex gap-2 items-center"><Truck size={16}/> Frete grátis · Previsão {deliveryWindow()}</p><p className="mt-1">Entrega estimada em 2 dias úteis após postagem.</p><p className="mt-1 text-[11px]">Envio no mesmo dia ou próximo dia útil. Estimativa sujeita à região e transportadora.</p></div>}
                     </div>
 
                     <div className="sm:col-span-2">
@@ -845,6 +856,7 @@ export const CheckoutPage: React.FC<CheckoutPageProps> = ({
                 </span>
               </div>
               <p className="mt-1 text-right text-xs text-muted-foreground">à vista no Pix</p>
+              <div className="mt-5 rounded-2xl border border-primary/15 bg-secondary/40 p-4"><div className="flex items-center gap-2 font-bold text-sm"><Truck size={18} className="text-primary"/> Sua entrega</div><p className="text-xs mt-2 text-muted-foreground">Postagem no mesmo dia ou próximo dia útil após o pagamento.</p>{deliveryReady||isPaid?<><p className="mt-3 text-sm font-bold">Previsão: {deliveryWindow()}</p><p className="text-xs mt-1 text-muted-foreground">2 dias úteis após postagem · Frete grátis</p>{formData.city&&<p className="text-xs mt-2">{formData.city} / {formData.state} · {formData.postalCode}</p>}</>:<p className="text-xs mt-3 font-semibold">{cepLoading?'Calculando…':'Informe seu CEP para ver a estimativa.'}</p>}<p className="text-[11px] mt-3 text-muted-foreground">Estimativa da loja. O prazo pode variar conforme a região e a transportadora.</p></div>
 
               {/* Security badges */}
               <div className="mt-6 space-y-2 border-t border-border/60 pt-4 text-xs text-muted-foreground">
@@ -854,7 +866,7 @@ export const CheckoutPage: React.FC<CheckoutPageProps> = ({
                 </div>
                 <div className="flex items-center gap-2">
                   <Truck className="h-4 w-4 text-primary shrink-0" />
-                  <span>Envio imediato com código de rastreamento</span>
+                  <span>Envio no mesmo dia ou próximo dia útil</span>
                 </div>
                 <div className="flex items-center gap-2">
                   <Lock className="h-4 w-4 text-primary shrink-0" />

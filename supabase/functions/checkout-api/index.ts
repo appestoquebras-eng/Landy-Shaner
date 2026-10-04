@@ -1,5 +1,14 @@
 
 declare const EdgeRuntime: any;
+export async function panelSignature(value:string, key:string) {
+ const secret=await crypto.subtle.importKey('raw',new TextEncoder().encode(key),{name:'HMAC',hash:'SHA-256'},false,['sign']);
+ return Array.from(new Uint8Array(await crypto.subtle.sign('HMAC',secret,new TextEncoder().encode('landy-panel:'+value)))).map(x=>x.toString(16).padStart(2,'0')).join('');
+}
+export async function validPanelToken(token:string,key:string,now=Date.now()) {
+ const [expires,nonce,signature,...extra]=token.split('.');
+ if(!key||extra.length||!/^\d{13}$/.test(expires||'')||! /^[a-f0-9-]{36}$/.test(nonce||'')||Number(expires)<=now||Number(expires)>now+3600000||! /^[a-f0-9]{64}$/.test(signature||''))return false;
+ return timingSafeEqualStr(signature,await panelSignature(expires+'.'+nonce,key));
+}
 export async function sendMetaEvent(token:string,version:string,event:unknown,fetchFn:typeof fetch=fetch,testCode?:string) {
  const body:any={data:[event]}; if(testCode)body.test_event_code=testCode;
  const res=await fetchFn('https://graph.facebook.com/'+version+'/1641693707389160/events',{
@@ -198,6 +207,42 @@ export function createCheckoutHandler(deps: CheckoutHandlerDeps = {}) {
     }
 
     try {
+      if(pathname.startsWith('/panel/')||pathname.startsWith('/analytics/')) {
+        const reply=(body:unknown,status=200)=>new Response(JSON.stringify(body),{status,headers:{...corsHeaders,'Cache-Control':'no-store'}});
+        const sb=await metaDb();
+        if(pathname==='/panel/login'&&req.method==='POST') {
+          const b=await req.json().catch(()=>({}));
+          if(typeof b.password!=='string'||b.password.length>128)return reply({error:'Senha inválida.'},401);
+          const ip=req.headers.get('cf-connecting-ip')||req.headers.get('x-forwarded-for')?.split(',')[0]?.trim()||'unknown';
+          const {data,error}=await sb.rpc('store_panel_login',{p_ip_hash:await sha256Hex(ip),p_password:b.password});
+          if(error)return reply({error:'Painel temporariamente indisponível.'},503);
+          if(!data)return reply({error:'Senha incorreta ou limite de tentativas atingido. Aguarde 15 minutos para tentar novamente.'},401);
+          const key=getEnv('SUPABASE_SERVICE_ROLE_KEY');if(!key)return reply({error:'Painel indisponível.'},503);
+          const value=String(Date.now()+3600000)+'.'+crypto.randomUUID();
+          return reply({token:value+'.'+await panelSignature(value,key)});
+        }
+        if(pathname==='/panel/stats'&&req.method==='GET') {
+          if(!await validPanelToken((req.headers.get('Authorization')||'').replace(/^Bearer /,''),getEnv('SUPABASE_SERVICE_ROLE_KEY')))return reply({error:'Sessão expirada ou acesso não autorizado.'},401);
+          const days=Number(url.searchParams.get('days')||30);if(![0,1,7,30].includes(days))return reply({error:'Período inválido.'},400);
+          const {data,error}=await sb.rpc('store_panel_stats',{p_days:days});
+          return error?reply({error:'Não foi possível consultar os números.'},503):reply(data);
+        }
+        if(pathname==='/analytics/event'&&req.method==='POST') {
+          const b=await req.json().catch(()=>({}));
+          if(!['visit','checkout'].includes(b.event)||! /^[a-f0-9]{8}(-[a-f0-9]{4}){3}-[a-f0-9]{12}$/i.test(b.visitor||''))return reply({error:'Evento inválido.'},400);
+          const {error}=await sb.from('store_events').upsert({visitor:b.visitor,event:b.event},{onConflict:'visitor,event,event_day',ignoreDuplicates:true});
+          return reply({success:!error},error?503:200);
+        }
+        if(pathname==='/analytics/copy'&&req.method==='POST') {
+          const b=await req.json().catch(()=>({}));
+          if(typeof b.token!=='string'||b.token.length<32||b.token.length>128||typeof b.orderId!=='string'||b.orderId.length>80)return reply({error:'Pedido inválido.'},400);
+          const {data:order}=await sb.from('orders').select('order_id,guest_token_hash,pix_code').eq('order_id',b.orderId).maybeSingle();
+          if(!order?.pix_code||!timingSafeEqualStr(order.guest_token_hash,await sha256Hex(b.token)))return reply({error:'Pedido não autorizado.'},403);
+          const {error}=await sb.from('store_pix_copies').upsert({order_id:b.orderId},{onConflict:'order_id',ignoreDuplicates:true});
+          return reply({success:!error},error?503:200);
+        }
+        return reply({error:'Rota não encontrada.'},404);
+      }
       if(['/meta/process','/meta/test'].includes(pathname)) {
         if(!metaToken)return new Response(JSON.stringify({error:'Meta não configurada'}),{status:503,headers:corsHeaders});
         if(req.method!=='POST'||!timingSafeEqualStr(req.headers.get('Authorization')||'','Bearer '+metaToken))return new Response(JSON.stringify({error:'Não autorizado'}),{status:401,headers:corsHeaders});
