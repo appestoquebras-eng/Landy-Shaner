@@ -1,3 +1,4 @@
+import {TestimonialsSection} from './TestimonialsSection';
 import {trackPurchase} from '../lib/meta';
 import {PurchaseNotifications} from './PurchaseNotifications';
 import {deliveryWindow} from '../lib/delivery';
@@ -889,6 +890,7 @@ export const CheckoutPage: React.FC<CheckoutPageProps> = ({
           </div>
         </div>
       </div>
+      <TestimonialsSection checkout />
     </div>
   );
 };
