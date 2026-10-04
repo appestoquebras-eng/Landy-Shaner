@@ -422,6 +422,198 @@ async function runEdgeFunctionTests() {
     forceRefundRpcError = false;
   });
 
+  // ------------------------------------------------------------------------
+  // 6. TESTES ADICIONAIS EXIGIDOS
+  // ------------------------------------------------------------------------
+  console.log('\n🔒 6. Testes Adicionais: Reuso Pending, Identificadores e Transições Proibidas');
+
+  await test('Webhook sem identifier é recusado com 400', async () => {
+    const req = new Request('https://ojvznzupiojimykqryhw.supabase.co/webhook', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        event: 'TRANSACTION_PAID',
+        token,
+        transaction: {
+          id: txId,
+          status: 'COMPLETED',
+          paymentMethod: 'PIX',
+          currency: 'BRL',
+          amount: 49.9,
+        },
+      }),
+    });
+    const res = await handler(req);
+    assert.strictEqual(res.status, 400);
+  });
+
+  await test('Webhook sem transactionId é recusado com 400', async () => {
+    const req = new Request('https://ojvznzupiojimykqryhw.supabase.co/webhook', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        event: 'TRANSACTION_PAID',
+        token,
+        transaction: {
+          identifier: ident,
+          status: 'COMPLETED',
+          paymentMethod: 'PIX',
+          currency: 'BRL',
+          amount: 49.9,
+        },
+      }),
+    });
+    const res = await handler(req);
+    assert.strictEqual(res.status, 400);
+  });
+
+  await test('Reuso de pedido pending com guestToken correto preserva acesso sem novo Pix', async () => {
+    const reusePayload = {
+      ...validPayload,
+      idempotencyKey: 'intent_reuse_pending_12345678901234',
+      clientGuestToken: 'client_guest_reuse_1234567890123456',
+    };
+
+    // Criação inicial
+    const req1 = new Request('https://ojvznzupiojimykqryhw.supabase.co/create', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(reusePayload),
+    });
+    const res1 = await handler(req1);
+    assert.strictEqual(res1.status, 200);
+    const data1 = await res1.json();
+    assert.strictEqual(data1.status, 'pending');
+
+    // Segunda chamada na mesma sessão
+    const req2 = new Request('https://ojvznzupiojimykqryhw.supabase.co/create', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(reusePayload),
+    });
+    const res2 = await handler(req2);
+    assert.strictEqual(res2.status, 200);
+    const data2 = await res2.json();
+    assert.strictEqual(data2.orderId, data1.orderId);
+    assert.strictEqual(data2.guestToken, reusePayload.clientGuestToken);
+
+    // Consulta de status com o guestToken correto
+    const reqStatus = new Request(`https://ojvznzupiojimykqryhw.supabase.co/status?orderId=${data2.orderId}&token=${reusePayload.clientGuestToken}`, {
+      method: 'GET',
+    });
+    const resStatus = await handler(reqStatus);
+    assert.strictEqual(resStatus.status, 200);
+  });
+
+  await test('Webhook com PAID e status WAITING_PAYMENT é recusado com 400 (strict AND)', async () => {
+    const req = new Request('https://ojvznzupiojimykqryhw.supabase.co/webhook', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        event: 'TRANSACTION_PAID',
+        token,
+        transaction: {
+          id: txId,
+          identifier: ident,
+          status: 'WAITING_PAYMENT', // Divergente
+          paymentMethod: 'PIX',
+          currency: 'BRL',
+          amount: 49.9,
+        },
+      }),
+    });
+    const res = await handler(req);
+    assert.strictEqual(res.status, 400);
+  });
+
+  await test('Webhook duplicado com método errado (CREDIT_CARD) é recusado com 400', async () => {
+    const req = new Request('https://ojvznzupiojimykqryhw.supabase.co/webhook', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        event: 'TRANSACTION_PAID',
+        token,
+        transaction: {
+          id: txId,
+          identifier: ident,
+          status: 'COMPLETED',
+          paymentMethod: 'CREDIT_CARD',
+          currency: 'BRL',
+          amount: 49.9,
+        },
+      }),
+    });
+    const res = await handler(req);
+    assert.strictEqual(res.status, 400);
+  });
+
+  await test('Webhook duplicado com moeda errada (USD) é recusado com 400', async () => {
+    const req = new Request('https://ojvznzupiojimykqryhw.supabase.co/webhook', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        event: 'TRANSACTION_PAID',
+        token,
+        transaction: {
+          id: txId,
+          identifier: ident,
+          status: 'COMPLETED',
+          paymentMethod: 'PIX',
+          currency: 'USD',
+          amount: 49.9,
+        },
+      }),
+    });
+    const res = await handler(req);
+    assert.strictEqual(res.status, 400);
+  });
+
+  await test('Pedido no estado terminal REFUNDED recebendo PAID é recusado com 400', async () => {
+    // Registra estorno no pedido de teste
+    orderRecord.status = 'refunded';
+
+    const req = new Request('https://ojvznzupiojimykqryhw.supabase.co/webhook', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        event: 'TRANSACTION_PAID',
+        token,
+        transaction: {
+          id: txId,
+          identifier: ident,
+          status: 'COMPLETED',
+          paymentMethod: 'PIX',
+          currency: 'BRL',
+          amount: 49.9,
+        },
+      }),
+    });
+    const res = await handler(req);
+    assert.strictEqual(res.status, 400);
+    assert.strictEqual(orderRecord.status, 'refunded'); // Não reverteu
+  });
+
+  await test('Falta de credenciais no servidor aborta com 503 ANTES de criar registro no banco', async () => {
+    const unconfigured = createCheckoutHandler({
+      supabaseClient: mockSupabase,
+      sigilopayPublicKey: '',
+      sigilopaySecretKey: '',
+    });
+
+    const ordersCountBefore = dbOrders.size;
+    const req = new Request('https://ojvznzupiojimykqryhw.supabase.co/create', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        ...validPayload,
+        idempotencyKey: 'intent_nocreds_123456789012345678',
+      }),
+    });
+    const res = await unconfigured(req);
+    assert.strictEqual(res.status, 503);
+    assert.strictEqual(dbOrders.size, ordersCountBefore); // Nenhum pedido inserido no banco!
+  });
+
   console.log(`\n======================================================`);
   console.log(`🎯 RESULTADO DOS TESTES NEGATIVOS: ${passed} Aprovados, ${failed} Falhas`);
   console.log(`======================================================\n`);

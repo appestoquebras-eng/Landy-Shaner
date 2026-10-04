@@ -4,6 +4,7 @@
 // =========================================================================
 
 declare const Deno: any;
+declare const process: any;
 
 export const CATALOG = {
   KIT_ID: 'kit-depilador-4em1',
@@ -166,13 +167,28 @@ export function createCheckoutHandler(deps: CheckoutHandlerDeps = {}) {
 
     try {
       if (pathname === '/health' || pathname === '/') {
+        let databaseReady: boolean | undefined;
+        if (url.searchParams.get('check') === 'database') {
+          let sb = deps.supabaseClient;
+          if (!sb && typeof Deno !== 'undefined') {
+            // @ts-ignore Deno resolves this package during Supabase deployment.
+            const { createClient } = await import('npm:@supabase/supabase-js@2.117.2');
+            sb = createClient(Deno.env.get('SUPABASE_URL') || '', Deno.env.get('SUPABASE_SERVICE_ROLE_KEY') || '', { auth: { persistSession: false } });
+          }
+          if (!sb) databaseReady = false;
+          else {
+            const { error } = await sb.from('orders').select('order_id').eq('order_id','health-probe-no-order').maybeSingle();
+            databaseReady = !error;
+          }
+        }
         return new Response(
           JSON.stringify({
             status: 'ok',
             service: 'landy-shaner-edge-checkout',
+            databaseReady,
             sigilopayConfigured: Boolean(SIGILOPAY_PUBLIC_KEY && SIGILOPAY_SECRET_KEY && SIGILOPAY_CALLBACK_URL),
           }),
-          { status: 200, headers: corsHeaders }
+          { status: databaseReady === false ? 503 : 200, headers: corsHeaders }
         );
       }
 
@@ -326,20 +342,18 @@ export function createCheckoutHandler(deps: CheckoutHandlerDeps = {}) {
 
         // Bind criptográfico do payload com a chave para detectar reuso indevido
         const payloadHash = await sha256Hex(
-          `${email.trim().toLowerCase()}|${cleanCpf}|${cleanCep}|${quantity}|${includeCream}|${amountCents}`
+          JSON.stringify([name.trim(),email.trim().toLowerCase(),cleanPhone,cleanCpf,cleanCep,street.trim(),houseNumber.trim(),complement ? String(complement).trim().slice(0,60) : null,district.trim(),city.trim(),cleanState,quantity,includeCream,amountCents])
         );
 
         // Gera OrderID robusto baseado em UUID para evitar colisão
-        const entropy = typeof crypto !== 'undefined' && crypto.randomUUID
-          ? crypto.randomUUID().replace(/-/g, '').slice(0, 8).toUpperCase()
-          : Math.random().toString(36).slice(2, 10).toUpperCase();
+        const entropy = crypto.randomUUID().replace(/-/g, '').toUpperCase();
         const newOrderId = `LS-${entropy}`;
         const newIdentifier = `sig_${newOrderId.toLowerCase()}_${Date.now()}`;
 
         let sb = deps.supabaseClient;
         if (!sb && typeof Deno !== 'undefined') {
-          const supabaseUrl = 'https://esm.sh/@supabase/supabase-js@2.39.8';
-          const { createClient } = await import(/* @vite-ignore */ supabaseUrl);
+          // @ts-ignore Deno resolves this package during Supabase deployment.
+          const { createClient } = await import('npm:@supabase/supabase-js@2.117.2');
           const sbUrl = Deno.env.get('SUPABASE_URL') || '';
           const sbKey = Deno.env.get('SUPABASE_SERVICE_ROLE_KEY') || '';
           sb = createClient(sbUrl, sbKey, { auth: { persistSession: false } });
@@ -654,8 +668,8 @@ export function createCheckoutHandler(deps: CheckoutHandlerDeps = {}) {
 
         let sb = deps.supabaseClient;
         if (!sb && typeof Deno !== 'undefined') {
-          const supabaseUrl = 'https://esm.sh/@supabase/supabase-js@2.39.8';
-          const { createClient } = await import(/* @vite-ignore */ supabaseUrl);
+          // @ts-ignore Deno resolves this package during Supabase deployment.
+          const { createClient } = await import('npm:@supabase/supabase-js@2.117.2');
           sb = createClient(Deno.env.get('SUPABASE_URL') || '', Deno.env.get('SUPABASE_SERVICE_ROLE_KEY') || '', { auth: { persistSession: false } });
         }
 
@@ -731,17 +745,17 @@ export function createCheckoutHandler(deps: CheckoutHandlerDeps = {}) {
         const transactionId = String(transaction.id || '').trim();
         const identifier = String(transaction.identifier || '').trim();
 
-        if (!transactionId && !identifier) {
+        if (!transactionId || !identifier) {
           return new Response(
-            JSON.stringify({ error: 'transaction.id ou identifier são obrigatórios.' }),
+            JSON.stringify({ error: 'transaction.id e identifier são obrigatórios.' }),
             { status: 400, headers: corsHeaders }
           );
         }
 
         let sb = deps.supabaseClient;
         if (!sb && typeof Deno !== 'undefined') {
-          const supabaseUrl = 'https://esm.sh/@supabase/supabase-js@2.39.8';
-          const { createClient } = await import(/* @vite-ignore */ supabaseUrl);
+          // @ts-ignore Deno resolves this package during Supabase deployment.
+          const { createClient } = await import('npm:@supabase/supabase-js@2.117.2');
           sb = createClient(Deno.env.get('SUPABASE_URL') || '', Deno.env.get('SUPABASE_SERVICE_ROLE_KEY') || '', { auth: { persistSession: false } });
         }
 
@@ -772,7 +786,7 @@ export function createCheckoutHandler(deps: CheckoutHandlerDeps = {}) {
         }
 
         // Validação estrita de identificadores correspondentes
-        if (identifier && order.identifier !== identifier) {
+        if (order.transaction_id !== transactionId || order.identifier !== identifier) {
           return new Response(
             JSON.stringify({ error: 'Identificadores da transação inconsistentes com a cobrança salva.' }),
             { status: 400, headers: corsHeaders }
@@ -951,9 +965,4 @@ export function createCheckoutHandler(deps: CheckoutHandlerDeps = {}) {
   };
 }
 
-if (typeof Deno !== 'undefined' && (import.meta as any).main) {
-  const serverUrl = 'https://deno.land/std@0.177.0/http/server.ts';
-  const { serve } = await import(/* @vite-ignore */ serverUrl);
-  const handler = createCheckoutHandler();
-  serve(handler);
-}
+export default { fetch: createCheckoutHandler() };
