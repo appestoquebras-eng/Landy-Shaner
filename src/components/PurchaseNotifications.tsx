@@ -20,9 +20,9 @@ const purchases = [
 ] as const;
 export function PurchaseNotifications(){
  const [duration,setDuration]=useState(7000);
- const [index,setIndex]=useState(0),[visible,setVisible]=useState(false),[closed,setClosed]=useState(()=>{try{return sessionStorage.getItem('landy_hide_purchase_notices')==='yes';}catch{return false;}});
+ const [index,setIndex]=useState(0),[visible,setVisible]=useState(false);
  useEffect(()=>{
-  if(closed)return;
+
   let timer:ReturnType<typeof setTimeout>;
   let next=0;
   const show=()=>{
@@ -34,9 +34,9 @@ export function PurchaseNotifications(){
   const hide=(event:FocusEvent)=>{if(event.target instanceof HTMLElement&&event.target.matches('input,textarea,select'))setVisible(false);};
   window.addEventListener('focusin',hide);
   return()=>{clearTimeout(timer);window.removeEventListener('focusin',hide);};
- },[closed]);
- const close=()=>{setClosed(true);setVisible(false);try{sessionStorage.setItem('landy_hide_purchase_notices','yes');}catch{}};
- if(!visible||closed)return null;
+ },[]);
+ const close=()=>setVisible(false);
+ if(!visible)return null;
  const [name,city,quantity]=purchases[index];
  return <aside aria-label="Compra anterior de cliente" style={{animation:`purchase-notice ${duration}ms ease both`}} className="purchase-notice fixed top-20 left-3 right-3 sm:left-1/2 sm:right-auto sm:-translate-x-1/2 sm:w-96 z-40 rounded-2xl border border-primary/15 bg-white shadow-lg p-4 flex gap-3 text-foreground">
   <div className="h-11 w-11 shrink-0 rounded-xl bg-secondary flex items-center justify-center"><ShoppingBag size={23} className="text-primary"/></div>
@@ -44,6 +44,7 @@ export function PurchaseNotifications(){
   <button type="button" onClick={close} aria-label="Fechar notificações de compras" className="absolute right-2 top-2 p-1 rounded-full text-muted-foreground hover:bg-muted"><X size={16}/></button>
  </aside>;
 }
+
 
 
 
