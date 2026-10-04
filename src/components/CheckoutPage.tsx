@@ -149,9 +149,10 @@ export const CheckoutPage: React.FC<CheckoutPageProps> = ({
     setCepMessage('Calculando a estimativa de entrega…');
     try {
       const res = await fetch(`https://viacep.com.br/ws/${cleanCep}/json/`);
+      if(!res.ok)throw new Error();
       const data = await res.json();
       if(request!==cepRequest.current)return;
-      if (data.erro) {
+      if (data.erro || !data.localidade || !data.uf) {
         setCepMessage('CEP não encontrado. Preencha o endereço manualmente.');
       } else {
         setFormData((prev) => ({
@@ -670,7 +671,6 @@ export const CheckoutPage: React.FC<CheckoutPageProps> = ({
                       {errors.postalCode && (
                         <p className="mt-1 text-xs text-destructive">{errors.postalCode}</p>
                       )}
-                      {deliveryReady&&<div role="status" className="mt-3 rounded-xl bg-emerald-50 border border-emerald-100 p-3 text-xs text-emerald-900"><p className="font-bold flex gap-2 items-center"><Truck size={16}/> Frete grátis · Previsão {deliveryWindow()}</p><p className="mt-1">Entrega estimada em 2 dias úteis após postagem.</p><p className="mt-1 text-[11px]">Envio no mesmo dia ou próximo dia útil. Estimativa sujeita à região e transportadora.</p></div>}
                     </div>
 
                     <div className="sm:col-span-2">
@@ -690,6 +690,9 @@ export const CheckoutPage: React.FC<CheckoutPageProps> = ({
                         <p className="mt-1 text-xs text-destructive">{errors.street}</p>
                       )}
                     </div>
+
+
+                      {deliveryReady&&<div role="status" className="sm:col-span-3 rounded-xl bg-emerald-50 border border-emerald-100 p-3 text-xs text-emerald-900"><p className="font-bold flex gap-2 items-center"><Truck size={16}/> Frete grátis · Previsão {deliveryWindow()}</p><p className="mt-1">Entrega estimada em 2 dias úteis após postagem.</p><p className="mt-1 text-[11px]">Envio no mesmo dia ou próximo dia útil. Estimativa sujeita à região e transportadora.</p></div>}
 
                     <div>
                       <label className="text-xs font-bold text-foreground">Número *</label>
@@ -887,4 +890,5 @@ export const CheckoutPage: React.FC<CheckoutPageProps> = ({
     </div>
   );
 };
+
 
