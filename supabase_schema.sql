@@ -35,6 +35,7 @@ CREATE TABLE IF NOT EXISTS public.orders (
     transaction_id TEXT UNIQUE,
     webhook_token TEXT,
     guest_token_hash TEXT NOT NULL,
+    payload_hash TEXT NOT NULL,
     paid_at TIMESTAMP WITH TIME ZONE,
     gateway_status TEXT,
     created_at TIMESTAMP WITH TIME ZONE DEFAULT timezone('utc'::text, now()) NOT NULL,
@@ -43,6 +44,9 @@ CREATE TABLE IF NOT EXISTS public.orders (
 
 DO $$
 BEGIN
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema='public' AND table_name='orders' AND column_name='payload_hash') THEN
+        ALTER TABLE public.orders ADD COLUMN payload_hash TEXT NOT NULL DEFAULT '';
+    END IF;
     IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema='public' AND table_name='orders' AND column_name='expires_at') THEN
         ALTER TABLE public.orders ADD COLUMN expires_at TIMESTAMP WITH TIME ZONE;
     END IF;
@@ -78,7 +82,7 @@ TO service_role
 USING (true)
 WITH CHECK (true);
 
--- RPC 1: Criar ou obter pendente com advisory lock
+-- RPC 1: Criar ou obter pendente
 CREATE OR REPLACE FUNCTION public.rpc_create_or_get_pending_order(
     p_idempotency_key TEXT,
     p_order_id TEXT,
@@ -98,12 +102,14 @@ CREATE OR REPLACE FUNCTION public.rpc_create_or_get_pending_order(
     p_include_cream BOOLEAN,
     p_total_price NUMERIC,
     p_amount_cents INTEGER,
-    p_guest_token_hash TEXT
+    p_guest_token_hash TEXT,
+    p_payload_hash TEXT
 )
 RETURNS TABLE (
     existing BOOLEAN,
     is_abusive BOOLEAN,
     token_mismatch BOOLEAN,
+    payload_mismatch BOOLEAN,
     order_id TEXT,
     identifier TEXT,
     status TEXT,
@@ -121,19 +127,9 @@ DECLARE
     v_recent_attempts INTEGER;
 BEGIN
     PERFORM pg_advisory_xact_lock(hashtext(p_idempotency_key));
+    PERFORM pg_advisory_xact_lock(hashtext(p_customer_cpf));
 
-    SELECT COUNT(*) INTO v_recent_attempts
-    FROM public.orders o
-    WHERE o.customer_cpf = p_customer_cpf
-      AND o.created_at > (now() - interval '1 hour');
-
-    IF v_recent_attempts >= 15 THEN
-        RETURN QUERY SELECT
-            FALSE, TRUE, FALSE, NULL::TEXT, NULL::TEXT, 'abusive'::TEXT, NULL::TEXT, NULL::TEXT, NULL::TIMESTAMPTZ, NULL::NUMERIC;
-        RETURN;
-    END IF;
-
-    SELECT o.order_id, o.identifier, o.status, o.pix_code, o.pix_image, o.expires_at, o.total_price, o.guest_token_hash
+    SELECT o.order_id, o.identifier, o.status, o.pix_code, o.pix_image, o.expires_at, o.total_price, o.guest_token_hash, o.payload_hash
     INTO v_existing_order
     FROM public.orders o
     WHERE o.idempotency_key = p_idempotency_key
@@ -142,13 +138,21 @@ BEGIN
     IF FOUND THEN
         IF v_existing_order.guest_token_hash <> p_guest_token_hash THEN
             RETURN QUERY SELECT
-                TRUE, FALSE, TRUE, v_existing_order.order_id, v_existing_order.identifier, v_existing_order.status,
+                TRUE, FALSE, TRUE, FALSE, v_existing_order.order_id, v_existing_order.identifier, v_existing_order.status,
+                NULL::TEXT, NULL::TEXT, NULL::TIMESTAMPTZ, v_existing_order.total_price;
+            RETURN;
+        END IF;
+
+        IF v_existing_order.payload_hash <> '' AND v_existing_order.payload_hash <> p_payload_hash THEN
+            RETURN QUERY SELECT
+                TRUE, FALSE, FALSE, TRUE, v_existing_order.order_id, v_existing_order.identifier, v_existing_order.status,
                 NULL::TEXT, NULL::TEXT, NULL::TIMESTAMPTZ, v_existing_order.total_price;
             RETURN;
         END IF;
 
         RETURN QUERY SELECT
             TRUE,
+            FALSE,
             FALSE,
             FALSE,
             v_existing_order.order_id,
@@ -158,6 +162,17 @@ BEGIN
             v_existing_order.pix_image,
             v_existing_order.expires_at,
             v_existing_order.total_price;
+        RETURN;
+    END IF;
+
+    SELECT COUNT(*) INTO v_recent_attempts
+    FROM public.orders o
+    WHERE o.customer_cpf = p_customer_cpf
+      AND o.created_at > (now() - interval '1 hour');
+
+    IF v_recent_attempts >= 15 THEN
+        RETURN QUERY SELECT
+            FALSE, TRUE, FALSE, FALSE, NULL::TEXT, NULL::TEXT, 'abusive'::TEXT, NULL::TEXT, NULL::TEXT, NULL::TIMESTAMPTZ, NULL::NUMERIC;
         RETURN;
     END IF;
 
@@ -184,6 +199,7 @@ BEGIN
         payment_method,
         status,
         guest_token_hash,
+        payload_hash,
         created_at,
         updated_at
     ) VALUES (
@@ -209,11 +225,13 @@ BEGIN
         'PIX',
         'creating',
         p_guest_token_hash,
+        p_payload_hash,
         now(),
         now()
     );
 
     RETURN QUERY SELECT
+        FALSE,
         FALSE,
         FALSE,
         FALSE,
@@ -230,7 +248,7 @@ $$;
 REVOKE ALL ON FUNCTION public.rpc_create_or_get_pending_order FROM PUBLIC, anon, authenticated;
 GRANT EXECUTE ON FUNCTION public.rpc_create_or_get_pending_order TO service_role;
 
--- RPC 2: Anexar dados da Sigilo Pay com alias explícito
+-- RPC 2: Anexar cobrança
 CREATE OR REPLACE FUNCTION public.rpc_attach_sigilopay_charge(
     p_order_id TEXT,
     p_identifier TEXT,
@@ -249,16 +267,17 @@ SET search_path = public, pg_temp
 AS $$
 BEGIN
     UPDATE public.orders
-    SET identifier = p_identifier,
-        transaction_id = p_transaction_id,
-        webhook_token = p_webhook_token,
-        pix_code = p_pix_code,
-        pix_image = p_pix_image,
-        expires_at = p_expires_at,
-        gateway_status = p_gateway_status,
+    SET transaction_id = COALESCE(p_transaction_id, public.orders.transaction_id),
+        webhook_token = COALESCE(p_webhook_token, public.orders.webhook_token),
+        pix_code = COALESCE(p_pix_code, public.orders.pix_code),
+        pix_image = COALESCE(p_pix_image, public.orders.pix_image),
+        expires_at = COALESCE(p_expires_at, public.orders.expires_at),
+        gateway_status = COALESCE(p_gateway_status, public.orders.gateway_status),
         status = p_status,
         updated_at = now()
-    WHERE public.orders.order_id = p_order_id;
+    WHERE public.orders.order_id = p_order_id
+      AND public.orders.identifier = p_identifier
+      AND public.orders.status IN ('creating', 'uncertain');
 
     RETURN FOUND;
 END;
@@ -267,7 +286,7 @@ $$;
 REVOKE ALL ON FUNCTION public.rpc_attach_sigilopay_charge FROM PUBLIC, anon, authenticated;
 GRANT EXECUTE ON FUNCTION public.rpc_attach_sigilopay_charge TO service_role;
 
--- RPC 3: Confirmar pagamento com AND estrito e proteção contra terminal
+-- RPC 3: Confirmar pagamento
 CREATE OR REPLACE FUNCTION public.rpc_confirm_sigilopay_payment(
     p_transaction_id TEXT,
     p_identifier TEXT,
@@ -323,7 +342,7 @@ $$;
 REVOKE ALL ON FUNCTION public.rpc_confirm_sigilopay_payment FROM PUBLIC, anon, authenticated;
 GRANT EXECUTE ON FUNCTION public.rpc_confirm_sigilopay_payment TO service_role;
 
--- RPC 4: Cancelamento / Estorno com AND estrito
+-- RPC 4: Cancelamento / Estorno
 CREATE OR REPLACE FUNCTION public.rpc_update_order_cancellation(
     p_transaction_id TEXT,
     p_identifier TEXT,
@@ -357,6 +376,11 @@ BEGIN
 
     IF v_order.status = 'paid' AND p_new_status = 'canceled' THEN
         RETURN QUERY SELECT FALSE, 'PAID_CANNOT_BE_CANCELED', v_order.order_id, v_order.status;
+        RETURN;
+    END IF;
+
+    IF v_order.status IN ('refunded', 'charged_back') AND p_new_status = 'canceled' THEN
+        RETURN QUERY SELECT FALSE, 'TERMINAL_STATE_CANNOT_CANCEL', v_order.order_id, v_order.status;
         RETURN;
     END IF;
 

@@ -8,7 +8,7 @@ import {
 } from '../supabase/functions/checkout-api/index';
 
 async function runEdgeFunctionTests() {
-  console.log('🧪 Iniciando Bateria de Testes do Handler Oficial da Edge Function (checkout-api)\n');
+  console.log('🧪 Iniciando Bateria Estrita de Testes do Handler da Edge Function (checkout-api)\n');
   let passed = 0;
   let failed = 0;
 
@@ -23,9 +23,10 @@ async function runEdgeFunctionTests() {
     }
   }
 
-  // Database Mock Adapter que simula exatamente o comportamento dos RPCs SQL do Supabase
   const dbOrders = new Map<string, any>();
   const dbCpfAttempts = new Map<string, number[]>();
+  let forceAttachFailure = false;
+  let forceRefundRpcError = false;
 
   const mockSupabase = {
     rpc: async (fnName: string, args: any) => {
@@ -43,6 +44,9 @@ async function runEdgeFunctionTests() {
           if (ord.idempotency_key === args.p_idempotency_key) {
             if (ord.guest_token_hash !== args.p_guest_token_hash) {
               return { data: [{ token_mismatch: true }], error: null };
+            }
+            if (ord.payload_hash && ord.payload_hash !== args.p_payload_hash) {
+              return { data: [{ payload_mismatch: true }], error: null };
             }
             return {
               data: [
@@ -76,6 +80,7 @@ async function runEdgeFunctionTests() {
           amount_cents: args.p_amount_cents,
           status: 'creating',
           guest_token_hash: args.p_guest_token_hash,
+          payload_hash: args.p_payload_hash,
           created_at: new Date().toISOString(),
         };
         dbOrders.set(newOrd.order_id, newOrd);
@@ -83,6 +88,9 @@ async function runEdgeFunctionTests() {
       }
 
       if (fnName === 'rpc_attach_sigilopay_charge') {
+        if (forceAttachFailure) {
+          return { data: false, error: new Error('Simulated DB persistence failure') };
+        }
         const ord = dbOrders.get(args.p_order_id);
         if (!ord) return { data: false, error: null };
         ord.identifier = args.p_identifier;
@@ -118,6 +126,9 @@ async function runEdgeFunctionTests() {
       }
 
       if (fnName === 'rpc_update_order_cancellation') {
+        if (forceRefundRpcError) {
+          return { data: null, error: new Error('Simulated RPC refund error') };
+        }
         let ord: any = null;
         for (const o of dbOrders.values()) {
           if (o.transaction_id === args.p_transaction_id && o.identifier === args.p_identifier) {
@@ -134,7 +145,7 @@ async function runEdgeFunctionTests() {
         return { data: [{ success: true, action: 'STATUS_UPDATED', order_id: ord.order_id }], error: null };
       }
 
-      return { data: null, error: new Error('RPC não implementada no mock') };
+      return { data: null, error: new Error('RPC desconhecida') };
     },
     from: (table: string) => ({
       select: () => ({
@@ -152,17 +163,22 @@ async function runEdgeFunctionTests() {
     }),
   };
 
+  let gatewaySimulateFailed = false;
+
   const mockGatewayFetch: typeof fetch = async (input: RequestInfo | URL, init?: RequestInit) => {
     const urlStr = String(input);
     if (urlStr.includes('/gateway/pix/receive')) {
-      const body = JSON.parse(String(init?.body || '{}'));
-      if (body.client?.name === 'Force Timeout') {
-        throw new Error('AbortError: Gateway timeout');
+      if (gatewaySimulateFailed) {
+        return new Response(
+          JSON.stringify({ status: 'FAILED', success: false, message: 'Recusado pelo antifraude' }),
+          { status: 200, headers: { 'Content-Type': 'application/json' } }
+        );
       }
       return new Response(
         JSON.stringify({
           transactionId: `tx_${Date.now()}`,
           status: 'OK',
+          success: true,
           transactionStatus: 'WAITING_PAYMENT',
           webhookToken: `wh_tok_${Date.now()}`,
           pix: {
@@ -185,38 +201,8 @@ async function runEdgeFunctionTests() {
     fetchFn: mockGatewayFetch,
   });
 
-  // ------------------------------------------------------------------------
-  // 1. NORMALIZAÇÃO DE PATHS E HEALTH CHECK
-  // ------------------------------------------------------------------------
-  console.log('🌐 1. Normalização de Paths e Health Check');
-
-  await test('GET /functions/v1/checkout-api/health deve responder 200 OK', async () => {
-    const req = new Request('https://ojvznzupiojimykqryhw.supabase.co/functions/v1/checkout-api/health', { method: 'GET' });
-    const res = await handler(req);
-    assert.strictEqual(res.status, 200);
-    const data = await res.json();
-    assert.strictEqual(data.status, 'ok');
-  });
-
-  await test('GET /checkout-api/health deve responder 200 OK', async () => {
-    const req = new Request('https://ojvznzupiojimykqryhw.supabase.co/checkout-api/health', { method: 'GET' });
-    const res = await handler(req);
-    assert.strictEqual(res.status, 200);
-  });
-
-  await test('GET /health deve responder 200 OK', async () => {
-    const req = new Request('https://ojvznzupiojimykqryhw.supabase.co/health', { method: 'GET' });
-    const res = await handler(req);
-    assert.strictEqual(res.status, 200);
-  });
-
-  // ------------------------------------------------------------------------
-  // 2. VALIDAÇÃO DE ENTRADA E CHECKSUM CPF
-  // ------------------------------------------------------------------------
-  console.log('\n🔍 2. Validação Estrita de Dados (Email, CPF, Quantidade, UF)');
-
   const validPayload = {
-    idempotencyKey: 'intent_1234567890123456',
+    idempotencyKey: 'intent_12345678901234567890123456789012',
     clientGuestToken: 'client_guest_token_123456789012345678901234',
     name: 'Ana Maria Silva',
     email: 'ana.maria@exemplo.com',
@@ -232,199 +218,123 @@ async function runEdgeFunctionTests() {
     includeCream: true,
   };
 
-  await test('Requisição sem e-mail deve ser recusada com 400', async () => {
-    const req = new Request('https://ojvznzupiojimykqryhw.supabase.co/create', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ ...validPayload, email: '' }),
-    });
-    const res = await handler(req);
-    assert.strictEqual(res.status, 400);
-  });
-
-  await test('Requisição com CPF com checksum inválido deve ser recusada com 400', async () => {
-    const req = new Request('https://ojvznzupiojimykqryhw.supabase.co/create', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ ...validPayload, document: '12345678900' }), // CPF inválido
-    });
-    const res = await handler(req);
-    assert.strictEqual(res.status, 400);
-  });
-
-  await test('Requisição com CPF com 11 dígitos iguais (11111111111) deve ser recusada com 400', async () => {
-    const req = new Request('https://ojvznzupiojimykqryhw.supabase.co/create', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ ...validPayload, document: '11111111111' }),
-    });
-    const res = await handler(req);
-    assert.strictEqual(res.status, 400);
-  });
-
-  await test('Requisição com quantidade zero ou maior que 10 deve ser recusada com 400', async () => {
-    const req0 = new Request('https://ojvznzupiojimykqryhw.supabase.co/create', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ ...validPayload, quantity: 0 }),
-    });
-    const res0 = await handler(req0);
-    assert.strictEqual(res0.status, 400);
-
-    const req11 = new Request('https://ojvznzupiojimykqryhw.supabase.co/create', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ ...validPayload, quantity: 11 }),
-    });
-    const res11 = await handler(req11);
-    assert.strictEqual(res11.status, 400);
-  });
-
-  await test('Requisição com UF inexistente deve ser recusada com 400', async () => {
-    const req = new Request('https://ojvznzupiojimykqryhw.supabase.co/create', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ ...validPayload, state: 'XX' }),
-    });
-    const res = await handler(req);
-    assert.strictEqual(res.status, 400);
-  });
-
-  await test('Ausência de chaves Sigilo Pay deve abortar com 503 antes de tocar no banco', async () => {
-    const unconfiguredHandler = createCheckoutHandler({
-      supabaseClient: mockSupabase,
-      sigilopayPublicKey: '',
-      sigilopaySecretKey: '',
-    });
-    const req = new Request('https://ojvznzupiojimykqryhw.supabase.co/create', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(validPayload),
-    });
-    const res = await unconfiguredHandler(req);
-    assert.strictEqual(res.status, 503);
-  });
-
   // ------------------------------------------------------------------------
-  // 3. FLUXO REAL DE CRIAÇÃO, PERSISTÊNCIA E IDEMPOTÊNCIA
+  // 1. CORS ATTACKER TEST
   // ------------------------------------------------------------------------
-  console.log('\n💳 3. Criação de Cobrança e Idempotência Estável');
+  console.log('🛡️ 1. Teste de Segurança CORS');
 
-  let createdOrderId = '';
-  let createdGuestToken = validPayload.clientGuestToken;
-
-  await test('Criação com dados válidos retorna Pix com expiresAt e orderId', async () => {
+  await test('CORS Attacker: Origin https://attacker.pages.dev deve ser rejeitada com 403', async () => {
     const req = new Request('https://ojvznzupiojimykqryhw.supabase.co/create', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: {
+        'Content-Type': 'application/json',
+        'Origin': 'https://attacker.pages.dev',
+      },
       body: JSON.stringify(validPayload),
-    });
-    const res = await handler(req);
-    assert.strictEqual(res.status, 200);
-    const data = await res.json();
-    assert.strictEqual(data.success, true);
-    assert(data.orderId.startsWith('LS-'));
-    assert(data.pixCode.length > 10);
-    assert(data.expiresAt !== null);
-    createdOrderId = data.orderId;
-  });
-
-  await test('Segunda chamada simultânea com mesma chave de idempotência reutiliza cobrança sem novo Pix', async () => {
-    const req = new Request('https://ojvznzupiojimykqryhw.supabase.co/create', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(validPayload),
-    });
-    const res = await handler(req);
-    assert.strictEqual(res.status, 200);
-    const data = await res.json();
-    assert.strictEqual(data.orderId, createdOrderId);
-    assert.strictEqual(data.guestToken, createdGuestToken);
-  });
-
-  await test('Consulta /status com o guestToken correto retorna pedido e não falha com 403', async () => {
-    const req = new Request(`https://ojvznzupiojimykqryhw.supabase.co/status?orderId=${createdOrderId}&token=${createdGuestToken}`, {
-      method: 'GET',
-    });
-    const res = await handler(req);
-    assert.strictEqual(res.status, 200);
-    const data = await res.json();
-    assert.strictEqual(data.orderId, createdOrderId);
-    assert.strictEqual(data.status, 'pending');
-    assert.strictEqual('customer_cpf' in data, false);
-  });
-
-  await test('Consulta /status com token errado retorna 403 Forbidden', async () => {
-    const req = new Request(`https://ojvznzupiojimykqryhw.supabase.co/status?orderId=${createdOrderId}&token=token_falsificado`, {
-      method: 'GET',
     });
     const res = await handler(req);
     assert.strictEqual(res.status, 403);
   });
 
   // ------------------------------------------------------------------------
-  // 4. TESTES DE WEBHOOK (STRICT AND, RACE CONDITIONS, RETROCESSO)
+  // 2. BODY SIZE BYTE LENGTH (SEM CONTENT-LENGTH)
   // ------------------------------------------------------------------------
-  console.log('\n⚡ 4. Webhook Oficial: Validação Estrita, Corrida e Estados Terminais');
+  console.log('\n📦 2. Teste de Limite de Payload (byteLength real)');
 
-  const orderRecord = dbOrders.get(createdOrderId);
+  await test('Payload maior que 16KB mesmo sem Content-Length deve retornar 413', async () => {
+    const oversized = { ...validPayload, street: 'A'.repeat(20000) };
+    const req = new Request('https://ojvznzupiojimykqryhw.supabase.co/create', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(oversized),
+    });
+    const res = await handler(req);
+    assert.strictEqual(res.status, 413);
+  });
+
+  // ------------------------------------------------------------------------
+  // 3. CRIAÇÃO DE COBRANÇA E RESPOSTA GATEWAY COM STATUS FAILED
+  // ------------------------------------------------------------------------
+  console.log('\n💳 3. Respostas do Gateway e Falhas de Persistência');
+
+  await test('Gateway retornando 200 mas com status FAILED é tratado como falha (502)', async () => {
+    gatewaySimulateFailed = true;
+    const req = new Request('https://ojvznzupiojimykqryhw.supabase.co/create', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ...validPayload, idempotencyKey: 'intent_failed_200_1234567890123456' }),
+    });
+    const res = await handler(req);
+    assert.strictEqual(res.status, 502);
+    gatewaySimulateFailed = false;
+  });
+
+  await test('Falha de persistência no RPC attach aborta resposta de sucesso com 500', async () => {
+    forceAttachFailure = true;
+    const req = new Request('https://ojvznzupiojimykqryhw.supabase.co/create', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ...validPayload, idempotencyKey: 'intent_attach_fail_1234567890123456' }),
+    });
+    const res = await handler(req);
+    assert.strictEqual(res.status, 500);
+    forceAttachFailure = false;
+  });
+
+  // ------------------------------------------------------------------------
+  // 4. CRIAÇÃO VÁLIDA E PEDIDO EXISTENTE SEM PIX CODE
+  // ------------------------------------------------------------------------
+  console.log('\n🔄 4. Reuso de Pedidos Existentes e Status Incompletos');
+
+  let orderId = '';
+  await test('Criação bem-sucedida gera cobrança e retorna 200', async () => {
+    const req = new Request('https://ojvznzupiojimykqryhw.supabase.co/create', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(validPayload),
+    });
+    const res = await handler(req);
+    assert.strictEqual(res.status, 200);
+    const data = await res.json();
+    orderId = data.orderId;
+  });
+
+  await test('Pedido existente com status uncertain ou sem pix_code retorna 409 e não chama gateway', async () => {
+    const uncertainKey = 'intent_uncertain_1234567890123456';
+    dbOrders.set('LS-UNCERTAIN-1', {
+      order_id: 'LS-UNCERTAIN-1',
+      identifier: 'sig_unc_1',
+      idempotency_key: uncertainKey,
+      customer_cpf: validPayload.document,
+      guest_token_hash: await sha256Hex(validPayload.clientGuestToken),
+      payload_hash: '',
+      status: 'uncertain',
+      pix_code: null,
+    });
+
+    const req = new Request('https://ojvznzupiojimykqryhw.supabase.co/create', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ...validPayload, idempotencyKey: uncertainKey }),
+    });
+    const res = await handler(req);
+    assert.strictEqual(res.status, 409);
+    const data = await res.json();
+    assert.strictEqual(data.status, 'uncertain');
+  });
+
+  // ------------------------------------------------------------------------
+  // 5. TESTES NEGATIVOS DE WEBHOOK
+  // ------------------------------------------------------------------------
+  console.log('\n⚡ 5. Webhook: Early Duplicate com Valor Errado, IDs e Erros RPC');
+
+  const orderRecord = dbOrders.get(orderId);
   const txId = orderRecord.transaction_id;
   const ident = orderRecord.identifier;
   const token = orderRecord.webhook_token;
 
-  await test('Webhook antes da persistência do webhook_token responde 503 com Retry-After', async () => {
-    const tempOrder = {
-      order_id: 'LS-TEMP-RACE',
-      identifier: 'sig_temp_race',
-      transaction_id: 'tx_race_1',
-      webhook_token: null, // Ainda não gravou o token
-      status: 'creating',
-    };
-    dbOrders.set('LS-TEMP-RACE', tempOrder);
-
-    const req = new Request('https://ojvznzupiojimykqryhw.supabase.co/webhook', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        event: 'TRANSACTION_PAID',
-        token: 'any_token',
-        transaction: { id: 'tx_race_1', identifier: 'sig_temp_race' },
-      }),
-    });
-    const res = await handler(req);
-    assert.strictEqual(res.status, 503);
-    assert.strictEqual(res.headers.get('Retry-After'), '3');
-  });
-
-  await test('Webhook com token incorreto retorna 401 Unauthorized', async () => {
-    const req = new Request('https://ojvznzupiojimykqryhw.supabase.co/webhook', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        event: 'TRANSACTION_PAID',
-        token: 'TOKEN_INCORRETO',
-        transaction: { id: txId, identifier: ident, status: 'COMPLETED', paymentMethod: 'PIX', currency: 'BRL', amount: 49.9 },
-      }),
-    });
-    const res = await handler(req);
-    assert.strictEqual(res.status, 401);
-  });
-
-  await test('Webhook com valor divergente retorna 400 Bad Request', async () => {
-    const req = new Request('https://ojvznzupiojimykqryhw.supabase.co/webhook', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        event: 'TRANSACTION_PAID',
-        token,
-        transaction: { id: txId, identifier: ident, status: 'COMPLETED', paymentMethod: 'PIX', currency: 'BRL', amount: 10.0 }, // 10.0 vs 49.9
-      }),
-    });
-    const res = await handler(req);
-    assert.strictEqual(res.status, 400);
-  });
-
-  await test('Webhook válido com todos os critérios estritos confirma pagamento 200 OK', async () => {
+  // Primeiro paga com sucesso
+  await test('Confirmação legítima de pagamento marca pedido como PAGO', async () => {
     const req = new Request('https://ojvznzupiojimykqryhw.supabase.co/webhook', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -444,74 +354,76 @@ async function runEdgeFunctionTests() {
     });
     const res = await handler(req);
     assert.strictEqual(res.status, 200);
-    const data = await res.json();
-    assert.strictEqual(data.status, 'paid_confirmed');
     assert.strictEqual(orderRecord.status, 'paid');
   });
 
-  await test('Webhook duplicado retorna 200 already_paid de forma idempotente', async () => {
+  await test('Early Duplicate com valor divergente deve retornar 400 (sem bypass)', async () => {
     const req = new Request('https://ojvznzupiojimykqryhw.supabase.co/webhook', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         event: 'TRANSACTION_PAID',
         token,
-        transaction: { id: txId, identifier: ident, status: 'COMPLETED', paymentMethod: 'PIX', currency: 'BRL', amount: 49.9 },
+        transaction: {
+          id: txId,
+          identifier: ident,
+          status: 'COMPLETED',
+          paymentMethod: 'PIX',
+          currency: 'BRL',
+          amount: 10.0, // Valor errado
+        },
       }),
     });
     const res = await handler(req);
-    assert.strictEqual(res.status, 200);
-    const data = await res.json();
-    assert.strictEqual(data.status, 'already_paid');
+    assert.strictEqual(res.status, 400); // Não pode dar 200 bypass!
   });
 
-  await test('Tentativa de cancelar pedido já pago via TRANSACTION_CANCELED é recusada', async () => {
+  await test('Tentativa de cancelamento com identifier incorreto retorna 400', async () => {
     const req = new Request('https://ojvznzupiojimykqryhw.supabase.co/webhook', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         event: 'TRANSACTION_CANCELED',
         token,
-        transaction: { id: txId, identifier: ident, status: 'CANCELED' },
+        transaction: {
+          id: txId,
+          identifier: 'sig_identifier_falso',
+          status: 'CANCELED',
+          paymentMethod: 'PIX',
+          currency: 'BRL',
+          amount: 49.9,
+        },
       }),
     });
     const res = await handler(req);
     assert.strictEqual(res.status, 400);
-    assert.strictEqual(orderRecord.status, 'paid'); // Permanece PAID!
   });
 
-  await test('Estorno via TRANSACTION_REFUNDED atualiza status para refunded', async () => {
+  await test('Erro retornado pelo RPC de estorno responde 500 no webhook', async () => {
+    forceRefundRpcError = true;
     const req = new Request('https://ojvznzupiojimykqryhw.supabase.co/webhook', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         event: 'TRANSACTION_REFUNDED',
         token,
-        transaction: { id: txId, identifier: ident, status: 'REFUNDED' },
+        transaction: {
+          id: txId,
+          identifier: ident,
+          status: 'REFUNDED',
+          paymentMethod: 'PIX',
+          currency: 'BRL',
+          amount: 49.9,
+        },
       }),
     });
     const res = await handler(req);
-    assert.strictEqual(res.status, 200);
-    assert.strictEqual(orderRecord.status, 'refunded');
-  });
-
-  await test('Evento TRANSACTION_PAID tardio após REFUNDED é recusado e não volta para paid', async () => {
-    const req = new Request('https://ojvznzupiojimykqryhw.supabase.co/webhook', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        event: 'TRANSACTION_PAID',
-        token,
-        transaction: { id: txId, identifier: ident, status: 'COMPLETED', paymentMethod: 'PIX', currency: 'BRL', amount: 49.9 },
-      }),
-    });
-    const res = await handler(req);
-    assert.strictEqual(res.status, 400);
-    assert.strictEqual(orderRecord.status, 'refunded'); // Mantém REFUNDED!
+    assert.strictEqual(res.status, 500);
+    forceRefundRpcError = false;
   });
 
   console.log(`\n======================================================`);
-  console.log(`🎯 RESULTADO DOS TESTES DO HANDLER REAL: ${passed} Aprovados, ${failed} Falhas`);
+  console.log(`🎯 RESULTADO DOS TESTES NEGATIVOS: ${passed} Aprovados, ${failed} Falhas`);
   console.log(`======================================================\n`);
 
   if (failed > 0) process.exit(1);

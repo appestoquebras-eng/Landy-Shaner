@@ -3,10 +3,8 @@
 // Runtime: Deno (100% Free no Supabase Edge Functions)
 // =========================================================================
 
-// Declaração de compatibilidade de tipos para compilação multiplataforma (Deno/Node)
 declare const Deno: any;
 
-// Configurações do Catálogo
 export const CATALOG = {
   KIT_ID: 'kit-depilador-4em1',
   KIT_NAME: 'Kit Depilador 4 em 1 Landy Shaner',
@@ -113,9 +111,6 @@ export interface CheckoutHandlerDeps {
   fetchFn?: typeof fetch;
 }
 
-/**
- * Cria a instância do handler HTTP de checkout (Deno / Supabase Edge Functions / Testes)
- */
 export function createCheckoutHandler(deps: CheckoutHandlerDeps = {}) {
   const getEnv = (key: string) => {
     if (typeof Deno !== 'undefined' && Deno.env) {
@@ -130,45 +125,44 @@ export function createCheckoutHandler(deps: CheckoutHandlerDeps = {}) {
   const SIGILOPAY_BASE_URL = deps.sigilopayBaseUrl || getEnv('SIGILOPAY_BASE_URL') || 'https://app.sigilopay.com.br/api/v1';
   const customOrigins = deps.allowedOrigins || (getEnv('ALLOWED_ORIGINS') ? getEnv('ALLOWED_ORIGINS').split(',').map((s: string) => s.trim()) : []);
 
-  const ALLOWED_ORIGINS = [
+  // CORS Estrito: Apenas igualdade exata (NUNCA .endsWith('.pages.dev') que abriria para atacantes)
+  const ALLOWED_ORIGINS = new Set([
     'https://landy-shaner.pages.dev',
-    ...customOrigins,
-  ];
+    ...customOrigins.filter(Boolean),
+  ]);
 
   const fetchClient = deps.fetchFn || fetch;
 
-  const getCorsHeaders = (req: Request): HeadersInit => {
-    const origin = req.headers.get('Origin');
-    if (!origin) {
-      return {
-        'Access-Control-Allow-Origin': '*',
-        'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
-        'Access-Control-Allow-Headers': 'Content-Type, Authorization, x-client-info, apikey',
-        'Content-Type': 'application/json',
-      };
-    }
-
-    const isAllowed = ALLOWED_ORIGINS.includes('*') || ALLOWED_ORIGINS.some((allowed) => allowed === origin || origin.endsWith('.pages.dev'));
-    const allowOrigin = isAllowed ? origin : ALLOWED_ORIGINS[0];
-
-    return {
-      'Access-Control-Allow-Origin': allowOrigin,
-      'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
-      'Access-Control-Allow-Headers': 'Content-Type, Authorization, x-client-info, apikey',
-      'Content-Type': 'application/json',
-    };
-  };
-
   return async (req: Request): Promise<Response> => {
-    const corsHeaders = getCorsHeaders(req);
-
-    if (req.method === 'OPTIONS') {
-      return new Response(null, { status: 204, headers: corsHeaders });
-    }
+    const origin = req.headers.get('Origin');
+    const isOptions = req.method === 'OPTIONS';
 
     const url = new URL(req.url);
     let pathname = url.pathname.replace(/^\/functions\/v1/, '').replace(/^\/checkout-api/, '');
     if (!pathname.startsWith('/')) pathname = '/' + pathname;
+
+    const isWebhook = pathname === '/webhook';
+
+    // Validação estrita de CORS para requisições de navegador
+    if (origin && !isWebhook) {
+      if (!ALLOWED_ORIGINS.has(origin) && !ALLOWED_ORIGINS.has('*')) {
+        return new Response(
+          JSON.stringify({ error: 'Origem CORS não autorizada.' }),
+          { status: 403, headers: { 'Content-Type': 'application/json' } }
+        );
+      }
+    }
+
+    const corsHeaders: HeadersInit = {
+      'Access-Control-Allow-Origin': origin && (ALLOWED_ORIGINS.has(origin) || ALLOWED_ORIGINS.has('*')) ? origin : 'https://landy-shaner.pages.dev',
+      'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
+      'Access-Control-Allow-Headers': 'Content-Type, Authorization, x-client-info, apikey',
+      'Content-Type': 'application/json',
+    };
+
+    if (isOptions) {
+      return new Response(null, { status: 204, headers: corsHeaders });
+    }
 
     try {
       if (pathname === '/health' || pathname === '/') {
@@ -182,15 +176,21 @@ export function createCheckoutHandler(deps: CheckoutHandlerDeps = {}) {
         );
       }
 
+      // ---------------------------------------------------------------------
+      // 1. CRIAR COBRANÇA PIX (/create)
+      // ---------------------------------------------------------------------
       if (pathname === '/create' && req.method === 'POST') {
-        const contentLength = parseInt(req.headers.get('content-length') || '0', 10);
-        if (contentLength > 16384) {
+        // Validação de tamanho por byteLength real do corpo
+        const rawText = await req.text();
+        const byteLength = new TextEncoder().encode(rawText).byteLength;
+        if (byteLength > 16384) {
           return new Response(
             JSON.stringify({ success: false, error: { message: 'Corpo da requisição excede limite de 16KB.' } }),
             { status: 413, headers: corsHeaders }
           );
         }
 
+        // Validação de credenciais ANTES de tocar no banco
         if (!SIGILOPAY_PUBLIC_KEY || !SIGILOPAY_SECRET_KEY || !SIGILOPAY_CALLBACK_URL) {
           return new Response(
             JSON.stringify({
@@ -204,10 +204,19 @@ export function createCheckoutHandler(deps: CheckoutHandlerDeps = {}) {
           );
         }
 
-        const body = await req.json().catch(() => ({}));
+        let body: any = {};
+        try {
+          body = JSON.parse(rawText || '{}');
+        } catch {
+          return new Response(
+            JSON.stringify({ success: false, error: { message: 'JSON inválido no corpo da requisição.' } }),
+            { status: 400, headers: corsHeaders }
+          );
+        }
+
         const {
-          idempotencyKey: rawIdemKey,
-          clientGuestToken: rawGuestToken,
+          idempotencyKey,
+          clientGuestToken,
           name,
           email,
           phone,
@@ -222,6 +231,22 @@ export function createCheckoutHandler(deps: CheckoutHandlerDeps = {}) {
           quantity,
           includeCream,
         } = body;
+
+        // Validação de chaves criptográficas obrigatórias (mínimo 32 caracteres)
+        const KEY_REGEX = /^[a-zA-Z0-9_-]{32,128}$/;
+        if (!idempotencyKey || typeof idempotencyKey !== 'string' || !KEY_REGEX.test(idempotencyKey.trim())) {
+          return new Response(
+            JSON.stringify({ success: false, error: { message: 'idempotencyKey obrigatória (chave criptográfica de no mínimo 32 caracteres).' } }),
+            { status: 400, headers: corsHeaders }
+          );
+        }
+
+        if (!clientGuestToken || typeof clientGuestToken !== 'string' || !KEY_REGEX.test(clientGuestToken.trim())) {
+          return new Response(
+            JSON.stringify({ success: false, error: { message: 'clientGuestToken obrigatório (token criptográfico de no mínimo 32 caracteres).' } }),
+            { status: 400, headers: corsHeaders }
+          );
+        }
 
         if (!name || typeof name !== 'string' || name.trim().length < 3 || name.trim().length > 100 || name.trim().split(' ').length < 2) {
           return new Response(
@@ -266,7 +291,7 @@ export function createCheckoutHandler(deps: CheckoutHandlerDeps = {}) {
             !district || typeof district !== 'string' || district.trim().length < 2 || district.trim().length > 60 ||
             !city || typeof city !== 'string' || city.trim().length < 2 || city.trim().length > 60) {
           return new Response(
-            JSON.stringify({ success: false, error: { message: 'Endereço de entrega incompleto ou excede limites.' } }),
+            JSON.stringify({ success: false, error: { message: 'Endereço de entrega incompleto ou inválido.' } }),
             { status: 400, headers: corsHeaders }
           );
         }
@@ -274,14 +299,14 @@ export function createCheckoutHandler(deps: CheckoutHandlerDeps = {}) {
         const cleanState = String(state || '').trim().toUpperCase();
         if (!VALID_UFS.has(cleanState)) {
           return new Response(
-            JSON.stringify({ success: false, error: { message: 'UF inválida (deve ser um estado brasileiro válido).' } }),
+            JSON.stringify({ success: false, error: { message: 'UF inválida (estado brasileiro inexistente).' } }),
             { status: 400, headers: corsHeaders }
           );
         }
 
         if (typeof quantity !== 'number' || !Number.isInteger(quantity) || quantity < 1 || quantity > 10) {
           return new Response(
-            JSON.stringify({ success: false, error: { message: 'Quantidade deve ser um número inteiro entre 1 e 10.' } }),
+            JSON.stringify({ success: false, error: { message: 'Quantidade deve ser um número inteiro de 1 a 10.' } }),
             { status: 400, headers: corsHeaders }
           );
         }
@@ -293,13 +318,22 @@ export function createCheckoutHandler(deps: CheckoutHandlerDeps = {}) {
           );
         }
 
-        const idempotencyKey = String(rawIdemKey || '').trim().slice(0, 128) || await sha256Hex(`idem_${cleanCpf}_${cleanPhone}_${quantity}_${includeCream}`);
-        const clientGuestToken = String(rawGuestToken || '').trim().slice(0, 128) || (crypto.randomUUID ? crypto.randomUUID().replace(/-/g, '') : Math.random().toString(36).slice(2));
-        const guestTokenHash = await sha256Hex(clientGuestToken);
+        const safeIdemKey = idempotencyKey.trim();
+        const safeGuestToken = clientGuestToken.trim();
+        const guestTokenHash = await sha256Hex(safeGuestToken);
 
         const { amountCents, amountReais, items } = calculateOrderAmounts(quantity, includeCream);
-        const randomSuffix = Math.floor(100000 + Math.random() * 900000);
-        const newOrderId = `LS-${randomSuffix}`;
+
+        // Bind criptográfico do payload com a chave para detectar reuso indevido
+        const payloadHash = await sha256Hex(
+          `${email.trim().toLowerCase()}|${cleanCpf}|${cleanCep}|${quantity}|${includeCream}|${amountCents}`
+        );
+
+        // Gera OrderID robusto baseado em UUID para evitar colisão
+        const entropy = typeof crypto !== 'undefined' && crypto.randomUUID
+          ? crypto.randomUUID().replace(/-/g, '').slice(0, 8).toUpperCase()
+          : Math.random().toString(36).slice(2, 10).toUpperCase();
+        const newOrderId = `LS-${entropy}`;
         const newIdentifier = `sig_${newOrderId.toLowerCase()}_${Date.now()}`;
 
         let sb = deps.supabaseClient;
@@ -318,10 +352,11 @@ export function createCheckoutHandler(deps: CheckoutHandlerDeps = {}) {
           );
         }
 
+        // RPC com Dual Advisory Lock (Key + CPF) e verificação de payload
         const { data: orderAttempt, error: rpcError } = await sb.rpc(
           'rpc_create_or_get_pending_order',
           {
-            p_idempotency_key: idempotencyKey,
+            p_idempotency_key: safeIdemKey,
             p_order_id: newOrderId,
             p_identifier: newIdentifier,
             p_customer_name: name.trim(),
@@ -340,6 +375,7 @@ export function createCheckoutHandler(deps: CheckoutHandlerDeps = {}) {
             p_total_price: amountReais,
             p_amount_cents: amountCents,
             p_guest_token_hash: guestTokenHash,
+            p_payload_hash: payloadHash,
           }
         );
 
@@ -359,14 +395,30 @@ export function createCheckoutHandler(deps: CheckoutHandlerDeps = {}) {
           );
         }
 
-        if (row?.token_mismatch) {
+        if (row?.token_mismatch || row?.payload_mismatch) {
           return new Response(
-            JSON.stringify({ success: false, error: { message: 'Conflito de autenticação da sessão de compra.' } }),
-            { status: 403, headers: corsHeaders }
+            JSON.stringify({ success: false, error: { message: 'Conflito de integridade com chave de checkout existente.' } }),
+            { status: 409, headers: corsHeaders }
           );
         }
 
+        // Se o pedido já existia para esta chave de idempotência
         if (row?.existing) {
+          // Se já está pago, retorna pago sem gerar QR code
+          if (row.status === 'paid') {
+            return new Response(
+              JSON.stringify({
+                success: true,
+                orderId: row.order_id,
+                guestToken: safeGuestToken,
+                status: 'paid',
+                totalPrice: Number(row.total_price),
+              }),
+              { status: 200, headers: corsHeaders }
+            );
+          }
+
+          // Se está em creating ou uncertain, NUNCA chama o gateway novamente
           if (row.status === 'creating') {
             return new Response(
               JSON.stringify({
@@ -389,25 +441,24 @@ export function createCheckoutHandler(deps: CheckoutHandlerDeps = {}) {
             );
           }
 
-          if (row.status === 'paid') {
+          if (['canceled', 'refunded', 'charged_back'].includes(row.status)) {
             return new Response(
               JSON.stringify({
-                success: true,
-                orderId: row.order_id,
-                guestToken: clientGuestToken,
-                status: 'paid',
-                totalPrice: Number(row.total_price),
+                success: false,
+                status: row.status,
+                error: { message: `Este pedido está cancelado ou estornado (${row.status}). Inicie uma nova compra.` },
               }),
-              { status: 200, headers: corsHeaders }
+              { status: 409, headers: corsHeaders }
             );
           }
 
+          // Se está pendente e possui pix_code, reutiliza
           if (row.pix_code) {
             return new Response(
               JSON.stringify({
                 success: true,
                 orderId: row.order_id,
-                guestToken: clientGuestToken,
+                guestToken: safeGuestToken,
                 pixCode: row.pix_code,
                 pixImage: row.pix_image || null,
                 expiresAt: row.expires_at || null,
@@ -417,6 +468,16 @@ export function createCheckoutHandler(deps: CheckoutHandlerDeps = {}) {
               { status: 200, headers: corsHeaders }
             );
           }
+
+          // Se por qualquer razão existente não tiver pix_code, NÃO chama fetch
+          return new Response(
+            JSON.stringify({
+              success: false,
+              status: row.status,
+              error: { message: 'Pedido existente sem código Pix disponível. Aguarde reconciliação.' },
+            }),
+            { status: 409, headers: corsHeaders }
+          );
         }
 
         const activeOrderId = row.order_id || newOrderId;
@@ -456,7 +517,13 @@ export function createCheckoutHandler(deps: CheckoutHandlerDeps = {}) {
 
           const sigiloJson = await sigiloRes.json().catch(() => ({}));
 
-          if (!sigiloRes.ok) {
+          // Se status HTTP não for OK OU resposta indicar falha expressa (success: false / status: FAILED)
+          const isGatewayFailed = !sigiloRes.ok ||
+            sigiloJson.status === 'FAILED' ||
+            sigiloJson.success === false ||
+            sigiloJson.transactionStatus === 'FAILED';
+
+          if (isGatewayFailed) {
             await sb.rpc('rpc_attach_sigilopay_charge', {
               p_order_id: activeOrderId,
               p_identifier: activeIdentifier,
@@ -472,12 +539,9 @@ export function createCheckoutHandler(deps: CheckoutHandlerDeps = {}) {
             return new Response(
               JSON.stringify({
                 success: false,
-                error: {
-                  statusCode: sigiloRes.status,
-                  message: 'Não foi possível gerar a cobrança Pix no gateway.',
-                },
+                error: { message: 'Não foi possível gerar a cobrança Pix no gateway.' },
               }),
-              { status: sigiloRes.status >= 400 && sigiloRes.status < 600 ? sigiloRes.status : 502, headers: corsHeaders }
+              { status: 502, headers: corsHeaders }
             );
           }
 
@@ -536,7 +600,7 @@ export function createCheckoutHandler(deps: CheckoutHandlerDeps = {}) {
             JSON.stringify({
               success: true,
               orderId: activeOrderId,
-              guestToken: clientGuestToken,
+              guestToken: safeGuestToken,
               pixCode,
               pixImage,
               expiresAt,
@@ -572,6 +636,9 @@ export function createCheckoutHandler(deps: CheckoutHandlerDeps = {}) {
         }
       }
 
+      // ---------------------------------------------------------------------
+      // 2. CONSULTA SEGURA DE STATUS (/status)
+      // ---------------------------------------------------------------------
       if (pathname === '/status' && req.method === 'GET') {
         const orderId = url.searchParams.get('orderId') || '';
         const guestToken = url.searchParams.get('token') || '';
@@ -629,8 +696,29 @@ export function createCheckoutHandler(deps: CheckoutHandlerDeps = {}) {
         );
       }
 
+      // ---------------------------------------------------------------------
+      // 3. WEBHOOK OFICIAL SIGILO PAY (/webhook)
+      // ---------------------------------------------------------------------
       if (pathname === '/webhook' && req.method === 'POST') {
-        const body = await req.json().catch(() => ({}));
+        const rawText = await req.text();
+        const byteLength = new TextEncoder().encode(rawText).byteLength;
+        if (byteLength > 16384) {
+          return new Response(
+            JSON.stringify({ error: 'Payload excede 16KB.' }),
+            { status: 413, headers: corsHeaders }
+          );
+        }
+
+        let body: any = {};
+        try {
+          body = JSON.parse(rawText || '{}');
+        } catch {
+          return new Response(
+            JSON.stringify({ error: 'Payload inválido.' }),
+            { status: 400, headers: corsHeaders }
+          );
+        }
+
         const { event, token, transaction } = body;
 
         if (!token || !transaction || typeof transaction !== 'object') {
@@ -643,9 +731,9 @@ export function createCheckoutHandler(deps: CheckoutHandlerDeps = {}) {
         const transactionId = String(transaction.id || '').trim();
         const identifier = String(transaction.identifier || '').trim();
 
-        if (!transactionId || !identifier) {
+        if (!transactionId && !identifier) {
           return new Response(
-            JSON.stringify({ error: 'Identificadores transaction.id e identifier são obrigatórios.' }),
+            JSON.stringify({ error: 'transaction.id ou identifier são obrigatórios.' }),
             { status: 400, headers: corsHeaders }
           );
         }
@@ -657,73 +745,82 @@ export function createCheckoutHandler(deps: CheckoutHandlerDeps = {}) {
           sb = createClient(Deno.env.get('SUPABASE_URL') || '', Deno.env.get('SUPABASE_SERVICE_ROLE_KEY') || '', { auth: { persistSession: false } });
         }
 
-        const { data: order, error: orderErr } = await sb
-          .from('orders')
-          .select('*')
-          .eq('transaction_id', transactionId)
-          .maybeSingle();
+        // Busca ordem primariamente por transaction_id
+        let order: any = null;
+        if (transactionId) {
+          const { data } = await sb.from('orders').select('*').eq('transaction_id', transactionId).maybeSingle();
+          order = data;
+        }
 
-        if (orderErr || !order) {
+        // Se não encontrou por transaction_id, busca por identifier para detectar corridas
+        if (!order && identifier) {
+          const { data: pendingOrd } = await sb.from('orders').select('*').eq('identifier', identifier).maybeSingle();
+          if (pendingOrd && ['creating', 'uncertain'].includes(pendingOrd.status)) {
+            // Webhook chegou antes do retorno do gateway anexar o transaction_id/token
+            return new Response(
+              JSON.stringify({ error: 'Cobrança em persistência. Tente novamente em instantes.' }),
+              { status: 503, headers: { ...corsHeaders, 'Retry-After': '3' } }
+            );
+          }
+        }
+
+        if (!order) {
           return new Response(
-            JSON.stringify({ error: 'Pedido associado ao transaction_id não localizado.' }),
+            JSON.stringify({ error: 'Pedido associado não localizado.' }),
             { status: 404, headers: corsHeaders }
           );
         }
 
-        if (order.identifier !== identifier) {
+        // Validação estrita de identificadores correspondentes
+        if (identifier && order.identifier !== identifier) {
           return new Response(
-            JSON.stringify({ error: 'Inconsistência entre transaction.id e identifier da cobrança.' }),
+            JSON.stringify({ error: 'Identificadores da transação inconsistentes com a cobrança salva.' }),
             { status: 400, headers: corsHeaders }
           );
         }
 
-        if (!order.webhook_token) {
-          return new Response(
-            JSON.stringify({ error: 'Cobrança em persistência. Tente novamente em instantes.' }),
-            { status: 503, headers: { ...corsHeaders, 'Retry-After': '3' } }
-          );
-        }
-
-        if (!timingSafeEqualStr(order.webhook_token, String(token))) {
+        // Validação estrita do webhook_token
+        if (!order.webhook_token || !timingSafeEqualStr(order.webhook_token, String(token))) {
           return new Response(
             JSON.stringify({ error: 'Token de autenticação do webhook inválido.' }),
             { status: 401, headers: corsHeaders }
           );
         }
 
-        if (order.status === 'paid' && (event === 'TRANSACTION_PAID' || transaction.status === 'COMPLETED')) {
+        // Valida moeda, método e valor em TODOS os eventos de confirmação ou alteração de estado
+        if (String(transaction.currency || '').toUpperCase() !== 'BRL') {
           return new Response(
-            JSON.stringify({ received: true, status: 'already_paid' }),
-            { status: 200, headers: corsHeaders }
+            JSON.stringify({ error: 'Moeda da transação inválida: esperado BRL.' }),
+            { status: 400, headers: corsHeaders }
           );
         }
 
+        if (transaction.paymentMethod !== 'PIX') {
+          return new Response(
+            JSON.stringify({ error: 'Método de pagamento inválido: esperado PIX.' }),
+            { status: 400, headers: corsHeaders }
+          );
+        }
+
+        const receivedCents = Math.round(Number(transaction.amount) * 100);
+        if (receivedCents !== order.amount_cents) {
+          return new Response(
+            JSON.stringify({ error: 'Valor da transação não confere com o pedido.' }),
+            { status: 400, headers: corsHeaders }
+          );
+        }
+
+        // 1. EVENTO DE PAGAMENTO CONCLUÍDO (Exige AMBOS event E status)
         const isStrictPaid =
           event === 'TRANSACTION_PAID' &&
-          transaction.status === 'COMPLETED' &&
-          transaction.paymentMethod === 'PIX';
+          transaction.status === 'COMPLETED';
 
         if (isStrictPaid) {
-          if (String(transaction.currency || '').toUpperCase() !== 'BRL') {
-            return new Response(
-              JSON.stringify({ error: 'Moeda da transação inválida: esperado BRL.' }),
-              { status: 400, headers: corsHeaders }
-            );
-          }
-
-          const receivedCents = Math.round(Number(transaction.amount) * 100);
-          if (receivedCents !== order.amount_cents) {
-            return new Response(
-              JSON.stringify({ error: 'Valor da transação não confere com o pedido.' }),
-              { status: 400, headers: corsHeaders }
-            );
-          }
-
           const { data: confirmRes, error: confirmErr } = await sb.rpc(
             'rpc_confirm_sigilopay_payment',
             {
-              p_transaction_id: transactionId,
-              p_identifier: identifier,
+              p_transaction_id: order.transaction_id,
+              p_identifier: order.identifier,
               p_payed_at: transaction.payedAt || new Date().toISOString(),
               p_gateway_status: 'COMPLETED',
             }
@@ -737,10 +834,17 @@ export function createCheckoutHandler(deps: CheckoutHandlerDeps = {}) {
           }
 
           const confirmRow = Array.isArray(confirmRes) ? confirmRes[0] : confirmRes;
-          if (confirmRow && !confirmRow.success) {
+          if (!confirmRow || !confirmRow.success) {
             return new Response(
-              JSON.stringify({ error: confirmRow.action || 'Transição de pagamento não permitida.' }),
+              JSON.stringify({ error: confirmRow?.action || 'Transição de pagamento não permitida.' }),
               { status: 400, headers: corsHeaders }
+            );
+          }
+
+          if (confirmRow.action === 'ALREADY_PAID') {
+            return new Response(
+              JSON.stringify({ received: true, status: 'already_paid' }),
+              { status: 200, headers: corsHeaders }
             );
           }
 
@@ -752,15 +856,16 @@ export function createCheckoutHandler(deps: CheckoutHandlerDeps = {}) {
 
         if (event === 'TRANSACTION_PAID') {
           return new Response(
-            JSON.stringify({ error: 'Evento de pagamento não atende aos critérios estritos.' }),
+            JSON.stringify({ error: 'Evento de pagamento não atende aos critérios estritos (status não é COMPLETED).' }),
             { status: 400, headers: corsHeaders }
           );
         }
 
-        if (event === 'TRANSACTION_CANCELED' || transaction.status === 'CANCELED') {
+        // 2. CANCELAMENTO (Exige AMBOS event E status)
+        if (event === 'TRANSACTION_CANCELED' && transaction.status === 'CANCELED') {
           const { data: cancelRes, error: cancelErr } = await sb.rpc('rpc_update_order_cancellation', {
-            p_transaction_id: transactionId,
-            p_identifier: identifier,
+            p_transaction_id: order.transaction_id,
+            p_identifier: order.identifier,
             p_new_status: 'canceled',
             p_gateway_status: 'CANCELED',
           });
@@ -770,36 +875,66 @@ export function createCheckoutHandler(deps: CheckoutHandlerDeps = {}) {
           }
 
           const cancelRow = Array.isArray(cancelRes) ? cancelRes[0] : cancelRes;
-          if (cancelRow && !cancelRow.success) {
-            return new Response(JSON.stringify({ error: cancelRow.action || 'Cancelamento rejeitado.' }), { status: 400, headers: corsHeaders });
+          if (!cancelRow || !cancelRow.success) {
+            return new Response(JSON.stringify({ error: cancelRow?.action || 'Cancelamento rejeitado.' }), { status: 400, headers: corsHeaders });
           }
 
           return new Response(JSON.stringify({ received: true, status: 'canceled' }), { status: 200, headers: corsHeaders });
         }
 
-        if (event === 'TRANSACTION_REFUNDED' || transaction.status === 'REFUNDED') {
-          await sb.rpc('rpc_update_order_cancellation', {
-            p_transaction_id: transactionId,
-            p_identifier: identifier,
+        // 3. ESTORNO (Exige AMBOS event E status)
+        if (event === 'TRANSACTION_REFUNDED' && transaction.status === 'REFUNDED') {
+          const { data: refundRes, error: refundErr } = await sb.rpc('rpc_update_order_cancellation', {
+            p_transaction_id: order.transaction_id,
+            p_identifier: order.identifier,
             p_new_status: 'refunded',
             p_gateway_status: 'REFUNDED',
           });
+
+          if (refundErr) {
+            return new Response(JSON.stringify({ error: 'Erro ao estornar pedido.' }), { status: 500, headers: corsHeaders });
+          }
+
+          const refundRow = Array.isArray(refundRes) ? refundRes[0] : refundRes;
+          if (!refundRow || !refundRow.success) {
+            return new Response(JSON.stringify({ error: refundRow?.action || 'Estorno rejeitado.' }), { status: 400, headers: corsHeaders });
+          }
+
           return new Response(JSON.stringify({ received: true, status: 'refunded' }), { status: 200, headers: corsHeaders });
         }
 
-        if (event === 'TRANSACTION_CHARGED_BACK' || transaction.status === 'CHARGED_BACK') {
-          await sb.rpc('rpc_update_order_cancellation', {
-            p_transaction_id: transactionId,
-            p_identifier: identifier,
+        // 4. CHARGEBACK (Exige AMBOS event E status)
+        if (event === 'TRANSACTION_CHARGED_BACK' && transaction.status === 'CHARGED_BACK') {
+          const { data: cbRes, error: cbErr } = await sb.rpc('rpc_update_order_cancellation', {
+            p_transaction_id: order.transaction_id,
+            p_identifier: order.identifier,
             p_new_status: 'charged_back',
             p_gateway_status: 'CHARGED_BACK',
           });
+
+          if (cbErr) {
+            return new Response(JSON.stringify({ error: 'Erro ao registrar chargeback.' }), { status: 500, headers: corsHeaders });
+          }
+
+          const cbRow = Array.isArray(cbRes) ? cbRes[0] : cbRes;
+          if (!cbRow || !cbRow.success) {
+            return new Response(JSON.stringify({ error: cbRow?.action || 'Chargeback rejeitado.' }), { status: 400, headers: corsHeaders });
+          }
+
           return new Response(JSON.stringify({ received: true, status: 'charged_back' }), { status: 200, headers: corsHeaders });
         }
 
+        // 5. EVENTO INTERMEDIÁRIO CREATED (Apenas se estiver em creating ou pending)
+        if (event === 'TRANSACTION_CREATED' && ['creating', 'pending'].includes(order.status)) {
+          return new Response(
+            JSON.stringify({ received: true, status: 'created_acknowledged' }),
+            { status: 200, headers: corsHeaders }
+          );
+        }
+
         return new Response(
-          JSON.stringify({ received: true, status: 'acknowledged' }),
-          { status: 200, headers: corsHeaders }
+          JSON.stringify({ error: 'Evento ou status não reconhecido.' }),
+          { status: 400, headers: corsHeaders }
         );
       }
 
@@ -809,17 +944,16 @@ export function createCheckoutHandler(deps: CheckoutHandlerDeps = {}) {
       );
     } catch {
       return new Response(
-        JSON.stringify({ error: 'Erro interno ao processar requisição.' }),
+        JSON.stringify({ error: 'Erro interno no servidor.' }),
         { status: 500, headers: corsHeaders }
       );
     }
   };
 }
 
-// Inicialização automática apenas se executado diretamente pelo Deno / Supabase
 if (typeof Deno !== 'undefined' && (import.meta as any).main) {
-  const supabaseUrl = 'https://deno.land/std@0.177.0/http/server.ts';
-  const { serve } = await import(/* @vite-ignore */ supabaseUrl);
+  const serverUrl = 'https://deno.land/std@0.177.0/http/server.ts';
+  const { serve } = await import(/* @vite-ignore */ serverUrl);
   const handler = createCheckoutHandler();
   serve(handler);
 }

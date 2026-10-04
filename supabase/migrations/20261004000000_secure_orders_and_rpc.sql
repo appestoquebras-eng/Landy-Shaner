@@ -36,27 +36,30 @@ CREATE TABLE IF NOT EXISTS public.orders (
     transaction_id TEXT UNIQUE,
     webhook_token TEXT,
     guest_token_hash TEXT NOT NULL,
+    payload_hash TEXT NOT NULL,
     paid_at TIMESTAMP WITH TIME ZONE,
     gateway_status TEXT,
     created_at TIMESTAMP WITH TIME ZONE DEFAULT timezone('utc'::text, now()) NOT NULL,
     updated_at TIMESTAMP WITH TIME ZONE DEFAULT timezone('utc'::text, now()) NOT NULL
 );
 
--- Garantir adição de colunas caso a tabela já tenha existido previamente
+-- Garantir adição de colunas em banco existente
 DO $$
 BEGIN
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema='public' AND table_name='orders' AND column_name='payload_hash') THEN
+        ALTER TABLE public.orders ADD COLUMN payload_hash TEXT NOT NULL DEFAULT '';
+    END IF;
     IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema='public' AND table_name='orders' AND column_name='expires_at') THEN
         ALTER TABLE public.orders ADD COLUMN expires_at TIMESTAMP WITH TIME ZONE;
     END IF;
     IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema='public' AND table_name='orders' AND column_name='idempotency_key') THEN
         ALTER TABLE public.orders ADD COLUMN idempotency_key TEXT UNIQUE;
     END IF;
-    -- Atualiza constraint de status caso necessário
     ALTER TABLE public.orders DROP CONSTRAINT IF EXISTS orders_status_check;
     ALTER TABLE public.orders ADD CONSTRAINT orders_status_check CHECK (status IN ('creating', 'pending', 'uncertain', 'paid', 'canceled', 'refunded', 'charged_back'));
 END $$;
 
--- 2. Índices de alta performance e integridade
+-- 2. Índices de integridade
 CREATE INDEX IF NOT EXISTS idx_orders_order_id ON public.orders (order_id);
 CREATE INDEX IF NOT EXISTS idx_orders_identifier ON public.orders (identifier);
 CREATE INDEX IF NOT EXISTS idx_orders_transaction_id ON public.orders (transaction_id);
@@ -84,7 +87,7 @@ USING (true)
 WITH CHECK (true);
 
 -- =========================================================================
--- 4. RPC ATÔMICO COM ADVISORY LOCK: Criar ou obter pedido com deduplicação
+-- 4. RPC ATÔMICO COM DUAL ADVISORY LOCK (KEY + CPF) E PAYLOAD HASH BIND
 -- =========================================================================
 CREATE OR REPLACE FUNCTION public.rpc_create_or_get_pending_order(
     p_idempotency_key TEXT,
@@ -105,12 +108,14 @@ CREATE OR REPLACE FUNCTION public.rpc_create_or_get_pending_order(
     p_include_cream BOOLEAN,
     p_total_price NUMERIC,
     p_amount_cents INTEGER,
-    p_guest_token_hash TEXT
+    p_guest_token_hash TEXT,
+    p_payload_hash TEXT
 )
 RETURNS TABLE (
     existing BOOLEAN,
     is_abusive BOOLEAN,
     token_mismatch BOOLEAN,
+    payload_mismatch BOOLEAN,
     order_id TEXT,
     identifier TEXT,
     status TEXT,
@@ -127,39 +132,37 @@ DECLARE
     v_existing_order RECORD;
     v_recent_attempts INTEGER;
 BEGIN
-    -- 1. Bloqueio transacional advisory lock pela chave de idempotência para serializar chamadas simultâneas
+    -- 1. Dual Advisory Lock: trava a chave de idempotência e o CPF do cliente
     PERFORM pg_advisory_xact_lock(hashtext(p_idempotency_key));
+    PERFORM pg_advisory_xact_lock(hashtext(p_customer_cpf));
 
-    -- 2. Proteção contra abuso no banco (máximo 15 tentativas por CPF na última hora)
-    SELECT COUNT(*) INTO v_recent_attempts
-    FROM public.orders o
-    WHERE o.customer_cpf = p_customer_cpf
-      AND o.created_at > (now() - interval '1 hour');
-
-    IF v_recent_attempts >= 15 THEN
-        RETURN QUERY SELECT
-            FALSE, TRUE, FALSE, NULL::TEXT, NULL::TEXT, 'abusive'::TEXT, NULL::TEXT, NULL::TEXT, NULL::TIMESTAMPTZ, NULL::NUMERIC;
-        RETURN;
-    END IF;
-
-    -- 3. Verifica se já existe pedido para esta chave estável de idempotência
-    SELECT o.order_id, o.identifier, o.status, o.pix_code, o.pix_image, o.expires_at, o.total_price, o.guest_token_hash
+    -- 2. Verifica reutilização de pedido existente ANTES de aplicar rate-limit (não bloqueia consulta legítima do próprio pedido)
+    SELECT o.order_id, o.identifier, o.status, o.pix_code, o.pix_image, o.expires_at, o.total_price, o.guest_token_hash, o.payload_hash
     INTO v_existing_order
     FROM public.orders o
     WHERE o.idempotency_key = p_idempotency_key
     LIMIT 1;
 
     IF FOUND THEN
-        -- Validação de segurança: o guest_token_hash precisa corresponder ao da intenção original
+        -- Validação de segurança: token do convidado deve bater
         IF v_existing_order.guest_token_hash <> p_guest_token_hash THEN
             RETURN QUERY SELECT
-                TRUE, FALSE, TRUE, v_existing_order.order_id, v_existing_order.identifier, v_existing_order.status,
+                TRUE, FALSE, TRUE, FALSE, v_existing_order.order_id, v_existing_order.identifier, v_existing_order.status,
+                NULL::TEXT, NULL::TEXT, NULL::TIMESTAMPTZ, v_existing_order.total_price;
+            RETURN;
+        END IF;
+
+        -- Validação de segurança: payload hash (email, cpf, itens, endereço) deve bater com a chave
+        IF v_existing_order.payload_hash <> '' AND v_existing_order.payload_hash <> p_payload_hash THEN
+            RETURN QUERY SELECT
+                TRUE, FALSE, FALSE, TRUE, v_existing_order.order_id, v_existing_order.identifier, v_existing_order.status,
                 NULL::TEXT, NULL::TEXT, NULL::TIMESTAMPTZ, v_existing_order.total_price;
             RETURN;
         END IF;
 
         RETURN QUERY SELECT
             TRUE,
+            FALSE,
             FALSE,
             FALSE,
             v_existing_order.order_id,
@@ -172,7 +175,19 @@ BEGIN
         RETURN;
     END IF;
 
-    -- 4. Criação atômica preliminar em estado 'creating' com identifier persistido ANTES da chamada ao gateway
+    -- 3. Proteção contra abuso para novos pedidos (máximo 15 tentativas por CPF na última hora)
+    SELECT COUNT(*) INTO v_recent_attempts
+    FROM public.orders o
+    WHERE o.customer_cpf = p_customer_cpf
+      AND o.created_at > (now() - interval '1 hour');
+
+    IF v_recent_attempts >= 15 THEN
+        RETURN QUERY SELECT
+            FALSE, TRUE, FALSE, FALSE, NULL::TEXT, NULL::TEXT, 'abusive'::TEXT, NULL::TEXT, NULL::TEXT, NULL::TIMESTAMPTZ, NULL::NUMERIC;
+        RETURN;
+    END IF;
+
+    -- 4. Criação atômica preliminar em estado 'creating'
     INSERT INTO public.orders (
         order_id,
         identifier,
@@ -196,6 +211,7 @@ BEGIN
         payment_method,
         status,
         guest_token_hash,
+        payload_hash,
         created_at,
         updated_at
     ) VALUES (
@@ -221,11 +237,13 @@ BEGIN
         'PIX',
         'creating',
         p_guest_token_hash,
+        p_payload_hash,
         now(),
         now()
     );
 
     RETURN QUERY SELECT
+        FALSE,
         FALSE,
         FALSE,
         FALSE,
@@ -243,7 +261,7 @@ REVOKE ALL ON FUNCTION public.rpc_create_or_get_pending_order FROM PUBLIC, anon,
 GRANT EXECUTE ON FUNCTION public.rpc_create_or_get_pending_order TO service_role;
 
 -- =========================================================================
--- 5. RPC ATÔMICO: Anexar dados retornados da Sigilo Pay (qualificação explícita)
+-- 5. RPC ATÔMICO: Anexar cobrança preservando status e campos (COALESCE)
 -- =========================================================================
 CREATE OR REPLACE FUNCTION public.rpc_attach_sigilopay_charge(
     p_order_id TEXT,
@@ -263,16 +281,17 @@ SET search_path = public, pg_temp
 AS $$
 BEGIN
     UPDATE public.orders
-    SET identifier = p_identifier,
-        transaction_id = p_transaction_id,
-        webhook_token = p_webhook_token,
-        pix_code = p_pix_code,
-        pix_image = p_pix_image,
-        expires_at = p_expires_at,
-        gateway_status = p_gateway_status,
+    SET transaction_id = COALESCE(p_transaction_id, public.orders.transaction_id),
+        webhook_token = COALESCE(p_webhook_token, public.orders.webhook_token),
+        pix_code = COALESCE(p_pix_code, public.orders.pix_code),
+        pix_image = COALESCE(p_pix_image, public.orders.pix_image),
+        expires_at = COALESCE(p_expires_at, public.orders.expires_at),
+        gateway_status = COALESCE(p_gateway_status, public.orders.gateway_status),
         status = p_status,
         updated_at = now()
-    WHERE public.orders.order_id = p_order_id;
+    WHERE public.orders.order_id = p_order_id
+      AND public.orders.identifier = p_identifier
+      AND public.orders.status IN ('creating', 'uncertain');
 
     RETURN FOUND;
 END;
@@ -282,7 +301,7 @@ REVOKE ALL ON FUNCTION public.rpc_attach_sigilopay_charge FROM PUBLIC, anon, aut
 GRANT EXECUTE ON FUNCTION public.rpc_attach_sigilopay_charge TO service_role;
 
 -- =========================================================================
--- 6. RPC ATÔMICO: Confirmação Estrita e Idempotente de Pagamento
+-- 6. RPC ATÔMICO: Confirmação de Pagamento com AND e Proteção Terminal
 -- =========================================================================
 CREATE OR REPLACE FUNCTION public.rpc_confirm_sigilopay_payment(
     p_transaction_id TEXT,
@@ -303,7 +322,6 @@ AS $$
 DECLARE
     v_order RECORD;
 BEGIN
-    -- Bloqueio da linha com FOR UPDATE exigindo AMBOS transaction_id E identifier
     SELECT o.id, o.order_id, o.status, o.amount_cents
     INTO v_order
     FROM public.orders o
@@ -316,19 +334,18 @@ BEGIN
         RETURN;
     END IF;
 
-    -- Proteção contra retrocesso: estados estornados/chargeback NÃO voltam para paid
+    -- Estados terminais estornados/chargeback NÃO podem voltar para paid
     IF v_order.status IN ('refunded', 'charged_back') THEN
         RETURN QUERY SELECT FALSE, 'TERMINAL_STATE_CANNOT_REVERT', v_order.order_id, v_order.status;
         RETURN;
     END IF;
 
-    -- Idempotência: se já está pago, não reprocessa
+    -- Idempotência estrita: se já estiver pago, confirma com ação ALREADY_PAID
     IF v_order.status = 'paid' THEN
         RETURN QUERY SELECT TRUE, 'ALREADY_PAID', v_order.order_id, v_order.status;
         RETURN;
     END IF;
 
-    -- Atualiza atomicamente para paid
     UPDATE public.orders
     SET status = 'paid',
         paid_at = COALESCE(p_payed_at, now()),
@@ -377,9 +394,15 @@ BEGIN
         RETURN;
     END IF;
 
-    -- Pedido já pago não pode ser cancelado via TRANSACTION_CANCELED (apenas refund/chargeback são permitidos)
+    -- Proíbe cancelamento comum de pedido que já foi pago
     IF v_order.status = 'paid' AND p_new_status = 'canceled' THEN
         RETURN QUERY SELECT FALSE, 'PAID_CANNOT_BE_CANCELED', v_order.order_id, v_order.status;
+        RETURN;
+    END IF;
+
+    -- Proíbe cancelamento comum de pedido que já foi estornado ou sofrido chargeback
+    IF v_order.status IN ('refunded', 'charged_back') AND p_new_status = 'canceled' THEN
+        RETURN QUERY SELECT FALSE, 'TERMINAL_STATE_CANNOT_CANCEL', v_order.order_id, v_order.status;
         RETURN;
     END IF;
 

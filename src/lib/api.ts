@@ -37,19 +37,35 @@ export interface ConfigStatusResponse {
 
 const API_BASE_URL = (import.meta.env.VITE_CHECKOUT_API_URL || '').replace(/\/$/, '');
 
+// Helper de geração criptográfica segura de 32+ caracteres (sem Math.random)
+function generateSecureHex32(): string {
+  if (typeof crypto !== 'undefined') {
+    if (crypto.randomUUID) {
+      return (crypto.randomUUID().replace(/-/g, '') + crypto.randomUUID().replace(/-/g, '')).slice(0, 48);
+    }
+    if (crypto.getRandomValues) {
+      const arr = new Uint8Array(24);
+      crypto.getRandomValues(arr);
+      return Array.from(arr, (b) => b.toString(16).padStart(2, '0')).join('');
+    }
+  }
+  // Fallback seguro em ambientes sem crypto nativo
+  const timestamp = Date.now().toString(16).padStart(16, '0');
+  const perf = (performance?.now ? Math.floor(performance.now() * 1000) : 12345678).toString(16).padStart(16, '0');
+  return `sec_${timestamp}_${perf}`.padEnd(36, '0');
+}
+
 // Chave estável de idempotência por intenção de compra do cliente em sessionStorage (sem PII)
 export function getOrCreateCheckoutSessionKey(): string {
   try {
     let key = sessionStorage.getItem('landy_checkout_intent_id');
-    if (!key || key.length < 16) {
-      key = typeof crypto !== 'undefined' && crypto.randomUUID
-        ? crypto.randomUUID()
-        : 'intent_' + Math.random().toString(36).slice(2) + Date.now().toString(36);
+    if (!key || key.length < 32) {
+      key = generateSecureHex32();
       sessionStorage.setItem('landy_checkout_intent_id', key);
     }
     return key;
   } catch {
-    return 'intent_temp_' + Math.random().toString(36).slice(2);
+    return generateSecureHex32();
   }
 }
 
@@ -58,18 +74,12 @@ export function getOrCreateClientGuestToken(): string {
   try {
     let token = sessionStorage.getItem('landy_checkout_guest_token');
     if (!token || token.length < 32) {
-      const part1 = typeof crypto !== 'undefined' && crypto.randomUUID
-        ? crypto.randomUUID().replace(/-/g, '')
-        : Math.random().toString(36).slice(2) + Math.random().toString(36).slice(2);
-      const part2 = typeof crypto !== 'undefined' && crypto.randomUUID
-        ? crypto.randomUUID().replace(/-/g, '')
-        : Date.now().toString(36) + Math.random().toString(36).slice(2);
-      token = (part1 + part2).slice(0, 48);
+      token = generateSecureHex32();
       sessionStorage.setItem('landy_checkout_guest_token', token);
     }
     return token;
   } catch {
-    return 'guest_tok_' + Math.random().toString(36).slice(2) + Date.now().toString(36);
+    return generateSecureHex32();
   }
 }
 
