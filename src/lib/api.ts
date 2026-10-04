@@ -1,3 +1,4 @@
+import {trackingContext,marketingAllowed} from './meta';
 import { CheckoutFormData } from '../types';
 
 export interface CreateChargeResponse {
@@ -92,6 +93,7 @@ export async function createCheckoutCharge(
   const clientGuestToken = getOrCreateClientGuestToken();
 
   const payload = {
+    marketing:trackingContext(),
     idempotencyKey,
     clientGuestToken,
     name: formData.name.trim(),
@@ -124,6 +126,13 @@ export async function createCheckoutCharge(
     error: { message: `Erro HTTP ${res.status} ao processar pagamento.` },
   }));
 
+  if(data.orderId&&data.guestToken) {
+    const order={orderId:data.orderId,token:data.guestToken};
+    try {sessionStorage.setItem('landy_meta_order',JSON.stringify(order));} catch {}
+    if(payload.marketing.consent&&!marketingAllowed()&&API_BASE_URL) {
+      await fetch(API_BASE_URL+'/meta/withdraw',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(order)}).catch(()=>{});
+    }
+  }
   return data;
 }
 
@@ -165,3 +174,5 @@ export async function fetchConfigStatus(): Promise<ConfigStatusResponse> {
     return { sigilopayConfigured: false, supabaseConfigured: false };
   }
 }
+
+window.addEventListener('landy-consent',()=>{if(marketingAllowed())return;try{const o=JSON.parse(sessionStorage.getItem('landy_meta_order')||'null');if(o&&API_BASE_URL)void fetch(API_BASE_URL+'/meta/withdraw',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(o)}).catch(()=>{});}catch{}});

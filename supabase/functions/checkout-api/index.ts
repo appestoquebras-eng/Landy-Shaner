@@ -1,3 +1,27 @@
+
+declare const EdgeRuntime: any;
+export async function sendMetaEvent(token:string,version:string,event:unknown,fetchFn:typeof fetch=fetch,testCode?:string) {
+ const body:any={data:[event]}; if(testCode)body.test_event_code=testCode;
+ const res=await fetchFn('https://graph.facebook.com/'+version+'/1641693707389160/events',{
+  method:'POST',headers:{'Content-Type':'application/json',Authorization:'Bearer '+token},
+  body:JSON.stringify(body),signal:AbortSignal.timeout(12000)});
+ const result=await res.json().catch(()=>({}));
+ return {ok:res.ok&&Number(result.events_received)>=1,retry:res.status===429||res.status>=500||Boolean(result.error?.is_transient),code:String(res.status)};
+}
+export async function processMetaBatch(sb:any,token:string,version:string,fetchFn:typeof fetch=fetch) {
+ if(!token)return {configured:false};
+ const {data,error}=await sb.rpc('meta_claim_batch'); if(error)throw new Error('META_CLAIM');
+ let sent=0;
+ for(const item of data||[]) {
+  let result:any={ok:false,retry:true,code:'NETWORK'};
+  if(Number(item.payload.event_time)<Math.floor(Date.now()/1000)-6*86400)result={ok:false,retry:false,code:'TOO_OLD'};
+  else try{result=await sendMetaEvent(token,version,item.payload,fetchFn);}catch{}
+  const state=result.ok?'sent':result.retry?'pending':'attention';
+  const {error:finishError}=await sb.rpc('meta_finish',{p_event_id:item.event_id,p_lease_id:item.lease_id,p_result:state,p_code:result.code});
+  if(finishError)throw new Error('META_FINISH'); if(result.ok)sent++;
+ }
+ return {configured:true,sent};
+}
 // =========================================================================
 // SUPABASE EDGE FUNCTION: checkout-api
 // Runtime: Deno (100% Free no Supabase Edge Functions)
@@ -110,6 +134,8 @@ export interface CheckoutHandlerDeps {
   sigilopayBaseUrl?: string;
   allowedOrigins?: string[];
   fetchFn?: typeof fetch;
+  metaToken?: string;
+  metaVersion?: string;
 }
 
 export function createCheckoutHandler(deps: CheckoutHandlerDeps = {}) {
@@ -133,6 +159,12 @@ export function createCheckoutHandler(deps: CheckoutHandlerDeps = {}) {
   ]);
 
   const fetchClient = deps.fetchFn || fetch;
+  const metaToken=deps.metaToken||getEnv('META_ACCESS_TOKEN');
+  const metaVersion=deps.metaVersion||getEnv('META_GRAPH_VERSION')||'v25.0';
+  const metaDb=async()=>{if(deps.supabaseClient)return deps.supabaseClient;
+    // @ts-ignore Deno resolves npm imports
+    const {createClient}=await import('npm:@supabase/supabase-js@2.117.2');
+    return createClient(getEnv('SUPABASE_URL'),getEnv('SUPABASE_SERVICE_ROLE_KEY'),{auth:{persistSession:false}});};
 
   return async (req: Request): Promise<Response> => {
     const origin = req.headers.get('Origin');
@@ -166,6 +198,14 @@ export function createCheckoutHandler(deps: CheckoutHandlerDeps = {}) {
     }
 
     try {
+      if(['/meta/process','/meta/test'].includes(pathname)) {
+        if(!metaToken)return new Response(JSON.stringify({error:'Meta não configurada'}),{status:503,headers:corsHeaders});
+        if(req.method!=='POST'||!timingSafeEqualStr(req.headers.get('Authorization')||'','Bearer '+metaToken))return new Response(JSON.stringify({error:'Não autorizado'}),{status:401,headers:corsHeaders});
+        const result=pathname==='/meta/test'
+          ? await sendMetaEvent(metaToken,metaVersion,{event_name:'Purchase',event_time:Math.floor(Date.now()/1000),event_id:'test_'+crypto.randomUUID(),action_source:'website',event_source_url:'https://landy-shaner.pages.dev/',user_data:{external_id:[await sha256Hex('meta-synthetic-test')]},custom_data:{currency:'BRL',value:34.90}},fetchClient,'TEST77664')
+          : await processMetaBatch(await metaDb(),metaToken,metaVersion,fetchClient);
+        return new Response(JSON.stringify(result),{status:(result as any).ok===false?502:200,headers:corsHeaders});
+      }
       if (pathname === '/health' || pathname === '/') {
         let databaseReady: boolean | undefined;
         if (url.searchParams.get('check') === 'database') {
@@ -416,6 +456,15 @@ export function createCheckoutHandler(deps: CheckoutHandlerDeps = {}) {
           );
         }
 
+        if(body.marketing && typeof body.marketing.consent==='boolean') {
+          const m=body.marketing;
+          const context:any={};
+          if(m.consent===true){context.em=[await sha256Hex(email.trim().toLowerCase())];context.ph=[await sha256Hex('55'+cleanPhone)];
+            if(typeof m.userAgent==='string')context.client_user_agent=m.userAgent.slice(0,512);
+            for(const k of ['fbp','fbc'])if(typeof m[k]==='string'&&/^fb\.\d\.\d{10,13}\.[A-Za-z0-9_.-]{1,300}$/.test(m[k]))context[k]=m[k];}
+          const {data:contextOk,error:contextError}=await sb.rpc('meta_set_context',{p_order_id:row.order_id||newOrderId,p_guest_hash:guestTokenHash,p_consent:m.consent===true,p_context:context});
+          if(contextError||!contextOk)return new Response(JSON.stringify({success:false,error:{message:'Erro ao salvar preferências. Nenhuma nova cobrança gerada.'}}),{status:500,headers:corsHeaders});
+        }
         // Se o pedido já existia para esta chave de idempotência
         if (row?.existing) {
           // Se já está pago, retorna pago sem gerar QR code
@@ -651,6 +700,12 @@ export function createCheckoutHandler(deps: CheckoutHandlerDeps = {}) {
       }
 
       // ---------------------------------------------------------------------
+      if(pathname==='/meta/withdraw'&&req.method==='POST') {
+        const raw=await req.text();if(new TextEncoder().encode(raw).length>1024)return new Response('{}',{status:413,headers:corsHeaders});
+        const b=JSON.parse(raw);const sb=await metaDb();
+        const {data,error}=await sb.rpc('meta_set_context',{p_order_id:String(b.orderId||''),p_guest_hash:await sha256Hex(String(b.token||'')),p_consent:false,p_context:{}});
+        return new Response(JSON.stringify({success:!error&&data===true}),{status:!error&&data===true?200:403,headers:corsHeaders});
+      }
       // 2. CONSULTA SEGURA DE STATUS (/status)
       // ---------------------------------------------------------------------
       if (pathname === '/status' && req.method === 'GET') {
@@ -855,6 +910,8 @@ export function createCheckoutHandler(deps: CheckoutHandlerDeps = {}) {
             );
           }
 
+          if(metaToken){const task=processMetaBatch(sb,metaToken,metaVersion,fetchClient).catch(()=>({configured:true,sent:0}));
+            if(typeof EdgeRuntime!=='undefined')EdgeRuntime.waitUntil(task);else await task;}
           if (confirmRow.action === 'ALREADY_PAID') {
             return new Response(
               JSON.stringify({ received: true, status: 'already_paid' }),

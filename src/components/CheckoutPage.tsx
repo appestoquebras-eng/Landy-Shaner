@@ -1,3 +1,4 @@
+import {trackPurchase} from '../lib/meta';
 import React, { useState, useEffect, useRef } from 'react';
 import {
   ArrowLeft,
@@ -220,6 +221,7 @@ export const CheckoutPage: React.FC<CheckoutPageProps> = ({
       }
 
       if (response.status === 'paid') {
+        trackPurchase(response.orderId||'',Number(response.totalPrice));
         setIsPaid(true);
         confetti({
           particleCount: 120,
@@ -293,6 +295,7 @@ export const CheckoutPage: React.FC<CheckoutPageProps> = ({
       try {
         const res = await checkOrderStatus(orderId, guestToken);
         if (res.success && res.status === 'paid') {
+          trackPurchase(res.orderId||orderId,Number(res.totalPrice));
           setIsPaid(true);
           confetti({
             particleCount: 120,

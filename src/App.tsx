@@ -1,3 +1,4 @@
+import {track} from './lib/meta';
 /**
  * @license
  * SPDX-License-Identifier: Apache-2.0
@@ -45,10 +46,12 @@ export default function App() {
   }, []);
 
   const handleOpenUpsell = () => {
+    track('AddToCart',{content_ids:['kit-depilador'],content_type:'product',currency:'BRL',value:quantity*34.90});
     setIsUpsellOpen(true);
   };
 
   const handleSelectUpsellOption = (withCream: boolean) => {
+    track('InitiateCheckout',{currency:'BRL',value:quantity*34.90+(withCream?15:0),num_items:quantity+(withCream?1:0)});
     setIncludeCream(withCream);
     setIsUpsellOpen(false);
     setCurrentPage('checkout');
